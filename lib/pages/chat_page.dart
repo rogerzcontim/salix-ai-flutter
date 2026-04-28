@@ -255,18 +255,12 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         label: res.fileName,
         text: res.extractedText,
       ));
-      final preview = res.extractedText.trim().replaceAll('\n', ' ');
-      final shortPreview =
-          preview.length > 80 ? '${preview.substring(0, 80)}…' : preview;
       String summary;
       if (kind == 'image') {
-        summary = preview.isEmpty
-            ? '📷 Foto enviada — nenhum texto identificado'
-            : '📷 Foto enviada — texto identificado: $shortPreview';
+        summary = '📷 Foto enviada (${res.fileName})';
       } else {
         final pages = res.pages != null ? '${res.pages} páginas' : 'extraído';
-        summary =
-            '📎 Arquivo anexado: ${res.fileName} ($pages) — texto extraído carregado no contexto';
+        summary = '📎 ${res.fileName} ($pages)';
       }
       setState(() {
         _messages[placeholderIdx]
@@ -275,17 +269,25 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           ..meta = {
             'file_id': res.fileId,
             'pages': res.pages,
-            'preview': shortPreview,
           };
+        _uploading = false;
       });
+      _scrollToBottom();
+
+      // Auto-trigger SALIX analysis (UX: upload = pergunta implícita)
+      final autoQuery = (kind == 'image')
+          ? 'Analise essa imagem em detalhes. Descreva o que aparece, contexto, e qualquer texto visível.'
+          : 'Resuma o conteúdo desse arquivo em pontos principais.';
+      // Pequeno delay pra UI atualizar antes do stream
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (mounted) await _send(autoQuery);
     } catch (e) {
       setState(() {
         _messages[placeholderIdx]
           ..content = '⚠️ Falha ao enviar $fileName: $e'
           ..toolStatus = 'error';
+        _uploading = false;
       });
-    } finally {
-      if (mounted) setState(() => _uploading = false);
       _scrollToBottom();
     }
   }
