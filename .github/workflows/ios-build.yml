@@ -1,0 +1,68 @@
+name: iOS unsigned build (sideload via AltStore)
+
+# Builds an unsigned .ipa on every push to main / tag v*.
+# Free tier: 2000 macOS minutes/month for private repos
+# (macOS minutes count 10x, so ~200 real minutes; one build ~10 min).
+
+on:
+  push:
+    branches: [ main, release/* ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build unsigned IPA on macOS
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show versions
+        run: |
+          flutter --version
+          xcodebuild -version
+          pod --version
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: CocoaPods install
+        run: |
+          cd ios
+          rm -rf Pods Podfile.lock
+          pod install --repo-update
+          cd ..
+
+      - name: Build iOS (no codesign)
+        run: |
+          flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -r Runner.app Payload/Runner.app
+          zip -qr "../../../salix_ai_unsigned.ipa" Payload
+          ls -la "../../../salix_ai_unsigned.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: salix_ai_unsigned_ipa
+          path: salix_ai_unsigned.ipa
+          retention-days: 14
+
+      - name: Upload Runner.app (for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: salix_ai_runner_app
+          path: build/ios/iphoneos/Runner.app
+          retention-days: 7
