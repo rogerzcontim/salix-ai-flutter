@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/message.dart';
@@ -13,11 +15,14 @@ import '../services/meta_agent_client.dart';
 import '../services/persona_store.dart';
 import '../services/upload_service.dart';
 import '../services/voice.dart';
+import '../services/wake_word.dart';
 import '../theme.dart';
+import 'memories_page.dart';
 import 'settings_page.dart';
 
 final _client = MetaAgentClient();
 final _voice = VoiceService();
+final _wake = WakeWordService();
 final _attachments = AttachmentsService();
 final _uploads = UploadService();
 
@@ -53,6 +58,11 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     if (p != null) {
       await _voice.initTts(p.voice);
     }
+    // Restore in-memory history per persona so re-opening the app feels
+    // continuous (Wave 1 / C4). Each persona has its own bucket.
+    if (p != null) {
+      await _restoreMessages(p.id);
+    }
     setState(() {
       _persona = p;
       if (_messages.isEmpty && p != null) {
@@ -61,8 +71,90 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           content:
               'Oi ${p.displayName}! Eu sou SALIX. Como posso ajudar hoje?',
         ));
+        _persistMessages();
       }
     });
+    // Onda 3 — wake word "Oi SALIX" se opt-in
+    await _maybeStartWakeWord();
+  }
+
+  Future<void> _maybeStartWakeWord() async {
+    if (!_wake.supported) return;
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool('wake_word.enabled') ?? false;
+    if (!enabled) return;
+    await _wake.start(
+      onDetected: () async {
+        // Já estiver gravando, ignora; senão dispara o mic.
+        if (_listening) return;
+        if (!mounted) return;
+        await _toggleMic();
+      },
+      onEvent: (ev) {
+        // Útil pra debug; sem UI ruidosa.
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _wake.stop();
+    super.dispose();
+  }
+
+  // -------------------------------------------------- Persistence (Wave 1 C4)
+
+  String? _persistKey(String personaId) => 'chat.history.$personaId.v1';
+
+  Future<void> _restoreMessages(String personaId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = _persistKey(personaId);
+      if (key == null) return;
+      final raw = prefs.getString(key);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return;
+      final restored = <ChatMessage>[];
+      for (final item in decoded) {
+        if (item is Map<String, dynamic>) {
+          restored.add(ChatMessage.fromJson(item));
+        }
+      }
+      // Cap restore at 200 entries — anything older will be available on a
+      // hypothetical /api/messages call but the local cache stays small.
+      if (restored.length > 200) {
+        restored.removeRange(0, restored.length - 200);
+      }
+      _messages
+        ..clear()
+        ..addAll(restored);
+    } catch (e) {
+      // Corrupted snapshot — just start fresh.
+      // ignore: avoid_print
+      print('[chat] restore failed: $e');
+    }
+  }
+
+  Future<void> _persistMessages() async {
+    final p = _persona;
+    if (p == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = _persistKey(p.id);
+      if (key == null) return;
+      // Only persist text + tool/artifact bubbles. Drop transient streaming
+      // state (the streaming flag isn't stored — content is the truth).
+      final tail = _messages.length > 200
+          ? _messages.sublist(_messages.length - 200)
+          : _messages;
+      final encoded =
+          jsonEncode(tail.map((m) => m.toJson()).toList(growable: false));
+      await prefs.setString(key, encoded);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[chat] persist failed: $e');
+    }
   }
 
   // ------------------------------------------------------------------ Send
@@ -138,7 +230,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                 _messages[idx]
                   ..kind = MessageKind.toolResult
                   ..toolStatus = ev.toolStatus
-                  ..content = ev.text ?? (ev.toolStatus == 'ok' ? 'enviado' : 'erro');
+                  ..content = ev.text ?? (ev.toolStatus == 'ok' ? 'enviado' : 'erro')
+                  // Wave 1 / C3: keep the raw payload so the chip can show
+                  // concrete proof (email message_id, file URL, etc).
+                  ..meta = ev.raw;
               } else {
                 _messages.insert(
                   _messages.length - 1, // before the active assistant bubble
@@ -191,13 +286,42 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           await IntentLauncher.dispatch(_messages[assistantIdx].content);
       _messages[assistantIdx].content = cleaned;
       if (mounted) setState(() => _streaming = false);
+      // Persist the final history to disk so opening the app later restores
+      // exactly what the user sees right now (Wave 1 / C4).
+      await _persistMessages();
       // Speak final text in the persona's language and chosen voice gender.
-      _voice.speak(
-        cleaned,
-        lang: p.voice,
-        gender: p.voiceGender,
-      );
+      // Skip if the response was canceled (just an "[interrompido]" marker).
+      if (!cleaned.trim().endsWith('[interrompido]')) {
+        _voice.speak(
+          cleaned,
+          lang: p.voice,
+          gender: p.voiceGender,
+        );
+      }
     }
+  }
+
+  /// User pressed STOP — abort the in-flight stream. The MetaAgentClient
+  /// closes its http.Client, which propagates a tear-down to the server, and
+  /// the server's r.Context() cancels the upstream request to the meta-adapter.
+  void _stopStream() {
+    if (!_streaming) return;
+    _client.cancel();
+    _voice.stopSpeaking();
+    setState(() {
+      _streaming = false;
+      // Mark the active assistant bubble as interrupted so the user sees
+      // immediate feedback (the SSE error event will arrive a moment later
+      // and append "[interrompido]").
+      if (_messages.isNotEmpty &&
+          _messages.last.role == Role.assistant &&
+          _messages.last.kind == MessageKind.text) {
+        if (!_messages.last.content.contains('[interrompido')) {
+          _messages.last.content += '\n_(interrompido)_';
+        }
+      }
+    });
+    _persistMessages();
   }
 
   /// Builds the system prompt for the next turn, optionally appending
@@ -370,12 +494,24 @@ class _ChatPageState extends ConsumerState<ChatPage> {
             },
           ),
           IconButton(
+            tooltip: 'Memórias',
+            icon: const Icon(Icons.psychology_outlined),
+            onPressed: () {
+              Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => const MemoriesPage(),
+              ));
+            },
+          ),
+          IconButton(
             tooltip: 'Limpar',
             icon: const Icon(Icons.delete_sweep),
-            onPressed: () => setState(() {
-              _messages.clear();
-              _pendingContext.clear();
-            }),
+            onPressed: () {
+              setState(() {
+                _messages.clear();
+                _pendingContext.clear();
+              });
+              _persistMessages(); // wipe disk too
+            },
           ),
         ],
       ),
@@ -472,17 +608,20 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                 ),
               ),
             ),
-            IconButton(
-              tooltip: 'Enviar',
-              onPressed: _streaming ? null : () => _send(),
-              icon: _streaming
-                  ? const SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2.4, color: IronTheme.cyan))
-                  : const Icon(Icons.send, color: IronTheme.cyan),
-            ),
+            // While streaming, swap send → STOP. Tap aborts in-flight request
+            // (Wave 1 / C1). Otherwise it's a regular send button.
+            _streaming
+                ? IconButton(
+                    tooltip: 'Parar resposta',
+                    onPressed: _stopStream,
+                    icon: const Icon(Icons.stop_circle,
+                        color: IronTheme.magenta, size: 28),
+                  )
+                : IconButton(
+                    tooltip: 'Enviar',
+                    onPressed: _uploading ? null : () => _send(),
+                    icon: const Icon(Icons.send, color: IronTheme.cyan),
+                  ),
           ],
         ),
       ),
@@ -532,9 +671,38 @@ class _Bubble extends StatelessWidget {
           );
         case MessageKind.toolResult:
           final ok = message!.toolStatus == 'ok';
-          final txt = ok
-              ? '✓ ${message!.toolName ?? 'tool'} ${text.isEmpty ? 'ok' : '($text)'}'
-              : '✗ ${message!.toolName ?? 'tool'} ${text.isEmpty ? 'erro' : '($text)'}';
+          final raw = message!.meta ?? const <String, dynamic>{};
+          final tool = message!.toolName ?? 'tool';
+          // Wave 1 / C3 — render concrete proof per-tool so the user sees
+          // exactly what shipped (recipient, message_id, filename, etc).
+          String txt;
+          if (!ok) {
+            final err = (raw['error'] ?? text).toString();
+            txt = '✗ $tool — ${err.isEmpty ? 'erro' : err}';
+          } else if (tool == 'send_email') {
+            final to   = (raw['to'] ?? raw['recipient'] ?? '').toString();
+            final subj = (raw['subject'] ?? '').toString();
+            final id   = (raw['message_id'] ?? raw['id'] ?? '').toString();
+            final sid  = id.length > 12 ? id.substring(0, 12) + '…' : id;
+            final parts = <String>[];
+            if (to.isNotEmpty)   parts.add('pra $to');
+            if (subj.isNotEmpty) parts.add('"$subj"');
+            if (sid.isNotEmpty)  parts.add('ID: $sid');
+            txt = '✓ Email enviado${parts.isEmpty ? '' : ' — ' + parts.join(' · ')}';
+          } else if (tool == 'create_xlsx') {
+            final fn = (raw['filename'] ?? '').toString();
+            txt = '✓ Planilha gerada${fn.isEmpty ? '' : ': $fn'}';
+          } else if (tool == 'create_pdf') {
+            final fn = (raw['filename'] ?? '').toString();
+            txt = '✓ PDF gerado${fn.isEmpty ? '' : ': $fn'}';
+          } else if (tool == 'web_search') {
+            final n = raw['results_count'];
+            txt = '✓ Busca completa${n is num ? ' (${n.toInt()} resultados)' : ''}';
+          } else if (tool == 'analyze_image') {
+            txt = '✓ Imagem analisada';
+          } else {
+            txt = text.isEmpty ? '✓ $tool' : '✓ $tool — $text';
+          }
           return _SystemChip(
             icon: ok ? Icons.check_circle : Icons.error_outline,
             text: txt,

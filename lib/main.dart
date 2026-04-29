@@ -5,7 +5,10 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'pages/chat_page.dart';
 import 'pages/onboarding_page.dart';
+import 'services/location_pinger.dart';
 import 'services/persona_store.dart';
+import 'services/push_notifications.dart';
+import 'services/theme_controller.dart';
 import 'theme.dart';
 
 Future<void> main() async {
@@ -16,18 +19,26 @@ Future<void> main() async {
   ));
   // Best-effort mic permission ahead of first STT call.
   Permission.microphone.request();
+  // Onda 4: location pinger foreground (silently no-ops without permission).
+  LocationPinger.start();
+  // Onda 8: push notifications init (best-effort, never blocks boot).
+  // ignore: discarded_futures
+  PushNotificationsService.instance.init();
   runApp(const ProviderScope(child: SalixApp()));
 }
 
-class SalixApp extends StatelessWidget {
+class SalixApp extends ConsumerWidget {
   const SalixApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final mode = ref.watch(themeModeProvider);
     return MaterialApp(
       title: 'SALIX AI',
       debugShowCheckedModeBanner: false,
-      theme: IronTheme.build(),
+      theme: IronTheme.build(light: true),
+      darkTheme: IronTheme.build(light: false),
+      themeMode: mode,
       home: const _Boot(),
     );
   }

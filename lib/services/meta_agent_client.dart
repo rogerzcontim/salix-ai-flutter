@@ -90,6 +90,21 @@ class MetaAgentClient {
   static const baseUrl = 'https://ironedgeai.com';
   static const endpoint = '$baseUrl/api/meta-agent/run';
 
+  /// Active client for the in-flight request. We hold a reference so the UI
+  /// can call [cancel] to abort streaming (Wave 1 / C1 STOP button).
+  http.Client? _activeClient;
+
+  /// Aborts any in-flight stream. Closing the http.Client tears the connection
+  /// down, which propagates client-side cancel to the SSE listener (LineSplitter
+  /// errors out, the catch in streamEvents emits an error event and exits).
+  void cancel() {
+    final c = _activeClient;
+    _activeClient = null;
+    try {
+      c?.close();
+    } catch (_) {}
+  }
+
   /// Backwards-compatible: yields only text deltas. Kept so older callers keep
   /// working without modification.
   Stream<String> stream({
@@ -136,6 +151,7 @@ class MetaAgentClient {
     req.body = body;
 
     final client = http.Client();
+    _activeClient = client;
     String currentEvent = 'message'; // default SSE event name
     try {
       final resp = await client.send(req);
@@ -185,9 +201,20 @@ class MetaAgentClient {
         if (delta != null) yield StreamEvent.delta(delta);
       }
     } catch (e) {
-      yield StreamEvent.error('\n[erro de rede: $e]');
+      // If user pressed STOP, the client.close() above will throw a
+      // ClientException("Connection closed..."). Surface that as a clean
+      // cancel marker rather than a scary [erro de rede:...] string.
+      final msg = e.toString();
+      if (msg.contains('closed') || msg.contains('aborted')) {
+        yield StreamEvent.error('\n[interrompido]');
+      } else {
+        yield StreamEvent.error('\n[erro de rede: $e]');
+      }
     } finally {
-      client.close();
+      try {
+        client.close();
+      } catch (_) {}
+      if (identical(_activeClient, client)) _activeClient = null;
     }
   }
 
@@ -235,17 +262,51 @@ class MetaAgentClient {
       final j = jsonDecode(payload);
       if (j is Map) {
         final name = (j['name'] ?? j['tool'] ?? '').toString();
-        final status = (j['status'] ?? (j['error'] != null ? 'error' : 'ok'))
-            .toString();
+        // Wave 1 / C3 — server now sends ok=bool and inline fields, normalise
+        // both the legacy {status} and the new {ok} shapes into one status.
+        String status;
+        if (j['ok'] is bool) {
+          status = (j['ok'] as bool) ? 'ok' : 'error';
+        } else if (j['status'] is String) {
+          status = j['status'] as String;
+        } else {
+          status = j['error'] != null ? 'error' : 'ok';
+        }
+        // Build a humanised summary line for the chip; the renderer in
+        // chat_page also has access to raw via `meta` for the rich view.
         String? text;
-        if (j['result'] is Map) {
-          final r = j['result'] as Map;
-          if (r['id'] != null) text = 'id: ${r['id']}';
-          else if (r['summary'] is String) text = r['summary'] as String;
-        } else if (j['result'] is String) {
-          text = j['result'] as String;
-        } else if (j['message'] is String) {
-          text = j['message'] as String;
+        if (name == 'send_email') {
+          final to = (j['to'] ?? j['recipient'] ?? '').toString();
+          final id = (j['message_id'] ?? j['id'] ?? '').toString();
+          if (to.isNotEmpty) {
+            text = 'pra $to';
+            if (id.isNotEmpty) {
+              final sid = id.length > 12 ? id.substring(0, 12) + '…' : id;
+              text = '$text (ID: $sid)';
+            }
+          }
+        } else if (name == 'create_xlsx' || name == 'create_pdf') {
+          final fn = (j['filename'] ?? '').toString();
+          final url = (j['url'] ?? '').toString();
+          if (fn.isNotEmpty) {
+            text = fn;
+          } else if (url.isNotEmpty) {
+            text = url.split('/').last;
+          }
+        } else if (name == 'web_search') {
+          final n = j['results_count'];
+          if (n is num) text = '${n.toInt()} resultados';
+        }
+        if (text == null) {
+          if (j['result'] is Map) {
+            final r = j['result'] as Map;
+            if (r['id'] != null) text = 'id: ${r['id']}';
+            else if (r['summary'] is String) text = r['summary'] as String;
+          } else if (j['result'] is String) {
+            text = j['result'] as String;
+          } else if (j['message'] is String) {
+            text = j['message'] as String;
+          }
         }
         if (j['error'] is String) text = j['error'] as String;
         return StreamEvent.toolResult(name, status,

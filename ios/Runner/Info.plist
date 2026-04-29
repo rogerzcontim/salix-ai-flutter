@@ -61,5 +61,40 @@
 	<string>SALIX usa reconhecimento de fala para converter sua voz em texto</string>
 	<key>NSDocumentsFolderUsageDescription</key>
 	<string>SALIX precisa acessar documentos para envio de PDFs e planilhas</string>
+
+	<!-- Onda 4 C9/C10/AU4: localização (geofencing) + contatos -->
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>SALIX usa sua localização para rotinas baseadas em lugar (chegada/saída)</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>SALIX precisa de localização sempre para disparar rotinas mesmo com app fechado</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>SALIX precisa de localização sempre para geofencing em background</string>
+	<key>NSContactsUsageDescription</key>
+	<string>SALIX usa contatos para fazer chamadas e enviar mensagens pelo nome</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>fetch</string>
+	</array>
+
+	<!-- Onda 4 C10: deep links pra apps externos. iOS exige declaração explícita -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>tel</string>
+		<string>sms</string>
+		<string>mailto</string>
+		<string>whatsapp</string>
+		<string>youtube</string>
+		<string>spotify</string>
+		<string>waze</string>
+		<string>uber</string>
+		<string>taxis99</string>
+		<string>ifood</string>
+		<string>meli</string>
+		<string>instagram</string>
+		<string>tg</string>
+		<string>telegram</string>
+		<string>comgooglemaps</string>
+	</array>
 </dict>
 </plist>

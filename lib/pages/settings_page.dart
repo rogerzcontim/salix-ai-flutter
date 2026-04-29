@@ -1,25 +1,54 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/persona.dart';
 import '../services/persona_store.dart';
+import '../services/push_notifications.dart';
+import '../services/theme_controller.dart';
+import '../services/wake_word.dart';
 import '../theme.dart';
+import 'device_controls_page.dart';
+import 'geofences_page.dart';
 import 'onboarding_page.dart';
+import 'routines_page.dart';
 
-class SettingsPage extends StatefulWidget {
+class SettingsPage extends ConsumerStatefulWidget {
   const SettingsPage({super.key});
   @override
-  State<SettingsPage> createState() => _SettingsPageState();
+  ConsumerState<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends ConsumerState<SettingsPage> {
   final _store = PersonaStore();
+  final _wake = WakeWordService();
   List<Persona> _personas = [];
   String? _activeId;
+  bool _wakeEnabled = false;
 
   @override
   void initState() {
     super.initState();
     _refresh();
+    _loadWakeEnabled();
+  }
+
+  Future<void> _loadWakeEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _wakeEnabled = prefs.getBool('wake_word.enabled') ?? false;
+    });
+  }
+
+  Future<void> _toggleWake(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('wake_word.enabled', v);
+    setState(() => _wakeEnabled = v);
+    if (v) {
+      await _wake.start(onDetected: () async {});
+    } else {
+      await _wake.stop();
+    }
   }
 
   Future<void> _refresh() async {
@@ -190,13 +219,138 @@ class _SettingsPageState extends State<SettingsPage> {
             icon: const Icon(Icons.person_add),
             label: const Text('NOVO USUÁRIO'),
           ),
+          const SizedBox(height: 24),
+          const Divider(),
+          const Text('AUTOMAÇÃO',
+              style: TextStyle(
+                  color: IronTheme.cyan,
+                  fontSize: 14,
+                  letterSpacing: 1.4,
+                  fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.auto_awesome,
+                  color: IronTheme.magenta),
+              title: const Text('Rotinas'),
+              subtitle: const Text(
+                'Frase de voz, horário, geofence ou app open → ações',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => const RoutinesPage())),
+            ),
+          ),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.place, color: IronTheme.magenta),
+              title: const Text('Geofences'),
+              subtitle: const Text(
+                'Locais que disparam rotinas ao entrar/sair',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => const GeofencesPage())),
+            ),
+          ),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.tune, color: IronTheme.magenta),
+              title: const Text('Controles do device'),
+              subtitle: const Text(
+                'Volume, brilho, lanterna, vibração, BT/Wifi',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => const DeviceControlsPage())),
+            ),
+          ),
+          // Onda 3 — wake word "Oi SALIX"
+          Card(
+            child: SwitchListTile(
+              secondary: const Icon(Icons.mic_none, color: IronTheme.magenta),
+              title: const Text('Wake word "Oi SALIX"'),
+              subtitle: Text(
+                _wake.supported
+                    ? 'Escuta sempre ativa em background. Pausa <15% bateria.'
+                    : 'Indisponível no iOS — use Siri Shortcut.',
+                style: const TextStyle(color: IronTheme.fgDim),
+              ),
+              value: _wakeEnabled && _wake.supported,
+              activeColor: IronTheme.cyan,
+              onChanged: _wake.supported ? _toggleWake : null,
+            ),
+          ),
+          const SizedBox(height: 24),
+          const Divider(),
+          const Text('APARÊNCIA',
+              style: TextStyle(
+                  color: IronTheme.cyan,
+                  fontSize: 14,
+                  letterSpacing: 1.4,
+                  fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          Card(
+            child: SwitchListTile(
+              secondary: const Icon(Icons.light_mode, color: IronTheme.magenta),
+              title: const Text('Tema claro'),
+              subtitle: const Text(
+                'Alterna entre dark (default) e light. Persiste entre sessões.',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              value: ref.watch(themeModeProvider) == ThemeMode.light,
+              activeColor: IronTheme.cyan,
+              onChanged: (v) async {
+                await ref
+                    .read(themeModeProvider.notifier)
+                    .set(v ? ThemeMode.light : ThemeMode.dark);
+              },
+            ),
+          ),
+
+          const SizedBox(height: 24),
+          const Divider(),
+          const Text('NOTIFICAÇÕES',
+              style: TextStyle(
+                  color: IronTheme.cyan,
+                  fontSize: 14,
+                  letterSpacing: 1.4,
+                  fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          FutureBuilder<bool>(
+            future: PushNotificationsService.instance.isEnabled(),
+            builder: (ctx, snap) {
+              final enabled = snap.data ?? true;
+              return Card(
+                child: SwitchListTile(
+                  secondary: const Icon(Icons.notifications_active,
+                      color: IronTheme.magenta),
+                  title: const Text('Push notifications'),
+                  subtitle: const Text(
+                    'Receba avisos quando uma tarefa longa terminar (FCM).',
+                    style: TextStyle(color: IronTheme.fgDim),
+                  ),
+                  value: enabled,
+                  activeColor: IronTheme.cyan,
+                  onChanged: (v) async {
+                    await PushNotificationsService.instance.setEnabled(v);
+                    setState(() {});
+                  },
+                ),
+              );
+            },
+          ),
+
           const SizedBox(height: 30),
           const Divider(),
           ListTile(
             leading: const Icon(Icons.info_outline),
             title: const Text('SALIX AI Personal'),
             subtitle: const Text(
-                'v1.3.0  •  voz humana Edge TTS  •  PT-BR / EN / IT  •  cyberpunk neon',
+                'v1.4.0+15  •  Onda 8: saúde + casa + veículo + iOS + tema light + PWA + push',
                 style: TextStyle(color: IronTheme.fgDim)),
           ),
         ],

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
+/// Iron Edge theme — dark default + light alternate (Onda 8).
 class IronTheme {
+  // Dark palette (default)
   static const cyan = Color(0xFF00FFFF);
   static const magenta = Color(0xFFFF00FF);
   static const bgDark = Color(0xFF05060A);
@@ -11,7 +13,21 @@ class IronTheme {
   static const danger = Color(0xFFFF3366);
   static const ok = Color(0xFF39FF14);
 
-  static ThemeData build() {
+  // Light palette (alternate)
+  static const lightBg = Color(0xFFFAFAFF);
+  static const lightPanel = Color(0xFFF0F0F7);
+  static const lightElev = Color(0xFFFFFFFF);
+  static const lightFgBright = Color(0xFF0E0E18);
+  static const lightFgDim = Color(0xFF6A6A82);
+  static const lightAccent = Color(0xFF0891B2);
+  static const lightAccent2 = Color(0xFF5B3EE8);
+
+  static ThemeData build({bool light = false}) {
+    if (light) return _buildLight();
+    return _buildDark();
+  }
+
+  static ThemeData _buildDark() {
     final base = ThemeData.dark(useMaterial3: true);
     return base.copyWith(
       scaffoldBackgroundColor: bgDark,
@@ -72,6 +88,72 @@ class IronTheme {
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(12),
           borderSide: const BorderSide(color: cyan, width: 1.4),
+        ),
+      ),
+    );
+  }
+
+  static ThemeData _buildLight() {
+    final base = ThemeData.light(useMaterial3: true);
+    return base.copyWith(
+      scaffoldBackgroundColor: lightBg,
+      colorScheme: const ColorScheme.light(
+        primary: lightAccent,
+        secondary: lightAccent2,
+        surface: lightPanel,
+        onPrimary: Colors.white,
+        onSecondary: Colors.white,
+        onSurface: lightFgBright,
+        error: Color(0xFFDC2626),
+      ),
+      appBarTheme: const AppBarTheme(
+        backgroundColor: lightPanel,
+        foregroundColor: lightAccent,
+        elevation: 0,
+        titleTextStyle: TextStyle(
+          color: lightAccent,
+          fontSize: 18,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 1.4,
+        ),
+      ),
+      drawerTheme: const DrawerThemeData(backgroundColor: lightPanel),
+      cardTheme: CardTheme(
+        color: lightElev,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: const BorderSide(color: Color(0x33000000)),
+        ),
+      ),
+      textTheme: base.textTheme.apply(
+        bodyColor: lightFgBright,
+        displayColor: lightFgBright,
+      ),
+      iconTheme: const IconThemeData(color: lightAccent),
+      dividerColor: const Color(0x22000000),
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: lightAccent,
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10)),
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: lightElev,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0x33000000)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0x33000000)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: lightAccent, width: 1.4),
         ),
       ),
     );
