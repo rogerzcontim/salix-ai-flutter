@@ -146,7 +146,52 @@ class WakeWordService {
     } catch (_) {}
   }
 
-  /// Status atual: {running:bool, lowBattery:bool, model:String}
+  // ---------- v4.1.0+29: Samsung Galaxy battery optimization helpers ----------
+
+  /// Verifica se a app já está na lista "Sem restrições" (ignoring battery
+  /// optimizations). Retorna true em iOS pra não bloquear lógica.
+  Future<bool> isIgnoringBatteryOptimizations() async {
+    if (!_supported) return true;
+    try {
+      final r = await _method.invokeMethod<bool>('isIgnoringBatteryOptimizations');
+      return r ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Pede pro Android abrir o dialog ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS.
+  /// User aceita -> volta pro app -> chamamos isIgnoringBatteryOptimizations()
+  /// pra confirmar. Em Samsung One UI o user cai em uma tela com toggle
+  /// "Permitir atividade em segundo plano" ou similar.
+  ///
+  /// Retorna true se ao final está ignoring (já estava OU acabou de aceitar).
+  Future<bool> requestIgnoreBatteryOpt() async {
+    if (!_supported) return true;
+    try {
+      final already = await isIgnoringBatteryOptimizations();
+      if (already) return true;
+      await _method.invokeMethod('requestIgnoreBatteryOptimizations');
+      // user vai pra Settings e volta — damos tempo pro foreground voltar
+      await Future<void>.delayed(const Duration(seconds: 2));
+      return await isIgnoringBatteryOptimizations();
+    } catch (e) {
+      if (kDebugMode) debugPrint('[wakeword] requestIgnoreBatteryOpt failed: $e');
+      return false;
+    }
+  }
+
+  /// Abre Configurações > Apps > SALIX AI (página de detalhes).
+  /// Útil pra Samsung One UI onde Battery > Sem restrições só fica
+  /// acessível por essa rota.
+  Future<void> openAppDetailsSettings() async {
+    if (!_supported) return;
+    try {
+      await _method.invokeMethod('openAppDetailsSettings');
+    } catch (_) {}
+  }
+
+    /// Status atual: {running:bool, lowBattery:bool, model:String}
   Future<Map<String, dynamic>> status() async {
     if (!_supported) {
       return {'running': false, 'supported': false};

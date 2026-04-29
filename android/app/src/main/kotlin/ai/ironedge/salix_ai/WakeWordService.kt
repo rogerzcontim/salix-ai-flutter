@@ -158,6 +158,27 @@ class WakeWordService : Service() {
         return START_STICKY
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // v7.0.0+32: usuario tirou app da tela. Se wake word estava
+        // ligado, agendamos restart imediato para o servico nao morrer.
+        // Como o usuario pode ter optado-out, so restart se running=true
+        // (ou seja, o service estava ativo nesse momento).
+        if (running) {
+            try {
+                val restart = Intent(applicationContext, WakeWordService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    applicationContext.startForegroundService(restart)
+                } else {
+                    applicationContext.startService(restart)
+                }
+                Log.i(TAG, "onTaskRemoved -> WakeWordService respawned")
+            } catch (t: Throwable) {
+                Log.w(TAG, "respawn after onTaskRemoved failed: ${t.message}")
+            }
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         stopFlag = true
         running = false

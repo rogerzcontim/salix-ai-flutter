@@ -10,6 +10,11 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
+    <!-- v4.1.0+29: Samsung One UI mata FG service mesmo com FG_SERVICE_TYPE_MICROPHONE
+         se o user nao desativa Battery Optimization. Pedimos via intent oficial. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
+        tools:ignore="BatteryLife"/>
+
     <!-- Onda 4: device control + automação -->
     <uses-permission android:name="android.permission.FLASHLIGHT"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
@@ -39,6 +44,13 @@
 
     <!-- Onda 3 — wake word "Oi SALIX" foreground service tipo microphone -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+
+    <!-- v7.0.0+32: ChatStreamService FG service tipo dataSync — agora
+         PERSISTENTE 24/7 (era so durante _send() no v6). Notif idle
+         "SALIX ativa em segundo plano". BootReceiver re-inicia depois de
+         reboot. Coexiste com WakeWordService (services separados). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
     <!-- Onda 4 C9: alarm/timer/call/sms -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>
@@ -196,5 +208,32 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="microphone"/>
+
+        <!-- v7.0.0+32: ChatStreamService — agora PERSISTENTE.
+             foregroundServiceType=dataSync. Notif IMPORTANCE_LOW. Sobe no
+             primeiro frame do app + apos BOOT_COMPLETED. NAO mais ligado
+             ao ciclo do _send(). -->
+        <service
+            android:name=".ChatStreamService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
+
+        <!-- v7.0.0+32: BootReceiver — sobe ChatStreamService apos reboot do
+             telefone, e apos atualizacao do APK (MY_PACKAGE_REPLACED).
+             Sem isso o usuario teria que abrir o app uma vez para o servico
+             voltar — exatamente o sintoma que Roger relatou. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

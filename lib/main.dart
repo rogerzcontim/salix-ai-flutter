@@ -24,6 +24,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'pages/chat_page.dart';
 import 'pages/onboarding_page.dart';
+import 'services/chat_stream_keepalive.dart';
 import 'services/crash_reporter.dart';
 import 'services/persona_store.dart';
 import 'theme.dart';
@@ -69,6 +70,16 @@ void main() {
     try {
       WidgetsBinding.instance.addObserver(_LifecycleAuditor());
     } catch (_) {}
+    // v7.0.0+32: sobe FG service ChatStreamService em modo persistente.
+    // Best-effort — se falhar (Android antigo, OEM chato), seguimos sem.
+    // O servico ja existe se BootReceiver tiver subido depois de reboot;
+    // chamar de novo eh idempotente (acao ACTION_START_PERSISTENT).
+    try {
+      // ignore: discarded_futures
+      ChatStreamKeepalive().ensurePersistent();
+    } catch (e) {
+      debugPrint('[main] ensurePersistent failed: $e');
+    }
     runApp(const ProviderScope(child: SalixAppLazy()));
   }, (error, stack) {
     try {
@@ -327,7 +338,7 @@ class _CrashScreen extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               const Text(
-                'Versão: 3.0.0+25  •  endpoint: salix-ai.com/api/_crash',
+                'Versão: 7.0.0+32  •  endpoint: salix-ai.com/api/_crash',
                 style: TextStyle(color: Colors.white38, fontSize: 10),
               ),
             ],

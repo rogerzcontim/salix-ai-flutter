@@ -24,6 +24,17 @@ class ChatMessage {
   String? artifactType; // pdf | xlsx | png | docx | image
   Map<String, dynamic>? meta;
 
+  /// v7.0.0+32: SQLite row id (null for in-memory-only messages).
+  int? dbId;
+
+  /// v7.0.0+32: lifecycle status persisted to disk:
+  ///   complete  — done, do nothing
+  ///   streaming — currently being filled by SSE deltas
+  ///   partial   — stream died mid-flight, content shows "↻ tentar novamente"
+  ///   failed    — exhausted retries, ditto
+  ///   sending   — user msg posted but no response yet
+  String status;
+
   ChatMessage({
     required this.role,
     required this.content,
@@ -34,6 +45,8 @@ class ChatMessage {
     this.artifactUrl,
     this.artifactType,
     this.meta,
+    this.dbId,
+    this.status = 'complete',
   }) : ts = ts ?? DateTime.now();
 
   /// Only text messages go into the API history. The server doesn't need to see
@@ -48,6 +61,7 @@ class ChatMessage {
         'content': content,
         'ts': ts.toIso8601String(),
         'kind': kind.name,
+        'status': status,
         if (toolName != null) 'toolName': toolName,
         if (toolStatus != null) 'toolStatus': toolStatus,
         if (artifactUrl != null) 'artifactUrl': artifactUrl,
@@ -68,5 +82,6 @@ class ChatMessage {
         artifactUrl: j['artifactUrl'],
         artifactType: j['artifactType'],
         meta: (j['meta'] is Map) ? Map<String, dynamic>.from(j['meta']) : null,
+        status: j['status'] is String ? (j['status'] as String) : 'complete',
       );
 }

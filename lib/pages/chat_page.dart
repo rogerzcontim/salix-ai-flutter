@@ -12,6 +12,8 @@ import 'package:url_launcher/url_launcher.dart';
 import '../models/message.dart';
 import '../models/persona.dart';
 import '../services/attachments.dart';
+import '../services/chat_stream_keepalive.dart';
+import '../services/conversation_db.dart';
 import '../services/crash_reporter.dart';
 import '../services/intent_launcher.dart';
 import '../services/meta_agent_client.dart';
@@ -20,6 +22,7 @@ import '../services/upload_service.dart';
 import '../services/voice.dart';
 import '../services/wake_word.dart';
 import '../theme.dart';
+import 'conversation_search_page.dart';
 import 'memories_page.dart';
 import 'settings_page.dart';
 import 'tools_catalog_page.dart';
@@ -29,6 +32,7 @@ final _voice = VoiceService();
 final _wake = WakeWordService();
 final _attachments = AttachmentsService();
 final _uploads = UploadService();
+final _chatKeepalive = ChatStreamKeepalive();
 
 class ChatPage extends ConsumerStatefulWidget {
   const ChatPage({super.key});
@@ -36,7 +40,8 @@ class ChatPage extends ConsumerStatefulWidget {
   ConsumerState<ChatPage> createState() => _ChatPageState();
 }
 
-class _ChatPageState extends ConsumerState<ChatPage> {
+class _ChatPageState extends ConsumerState<ChatPage>
+    with WidgetsBindingObserver {
   final _input = TextEditingController();
   final _scroll = ScrollController();
   final List<ChatMessage> _messages = [];
@@ -51,9 +56,21 @@ class _ChatPageState extends ConsumerState<ChatPage> {
   bool _uploading = false;
   String _partialVoice = '';
 
+  /// v7.0.0+32: SQLite conversation id (active = most recent for persona).
+  int? _convId;
+
+  /// Throttler so streaming token deltas don't hammer SQLite.
+  final AssistantContentThrottler _dbThrottle = AssistantContentThrottler();
+
+  /// Highlight a specific message id when arriving from search.
+  int? _highlightMessageDbId;
+
   @override
   void initState() {
     super.initState();
+    // v6.0.0+31: observe lifecycle so we can keep the chat keepalive service
+    // alive across screen-off transitions (Samsung Galaxy S24 Doze fix).
+    WidgetsBinding.instance.addObserver(this);
     // v1.8.0: defer ALL side-effects to post-first-frame; never block initState.
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       try {
@@ -62,6 +79,22 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         debugPrint('[chat] _load failed: $e\n$st');
       }
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // v7.0.0+32: on resume, ALWAYS jump to bottom (Roger: "tem que rolar
+    // para a ultima pergunta"). Persistent FG service guarantees nothing
+    // was lost; we just need to refresh the view if SQLite has new
+    // content (e.g., another instance wrote while we were paused — rare).
+    if (state == AppLifecycleState.paused) {
+      // ignore: discarded_futures
+      _dbThrottle.flush();
+      CrashReporter.info('chat.paused streaming=$_streaming');
+    } else if (state == AppLifecycleState.resumed) {
+      _jumpToBottom();
+      CrashReporter.info('chat.resumed streaming=$_streaming');
+    }
   }
 
   Future<void> _load() async {
@@ -79,13 +112,15 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         debugPrint('[chat] initTts failed: $e');
       }
     }
-    // Restore in-memory history per persona so re-opening the app feels
-    // continuous (Wave 1 / C4). Each persona has its own bucket.
+    // v7.0.0+32: load all messages from SQLite for the active conversation.
+    // shared_preferences fallback is also imported below for legacy users
+    // upgrading from v6, so on first run we migrate the in-memory history
+    // into the new schema.
     if (p != null) {
       try {
-        await _restoreMessages(p.id);
+        await _loadFromDb(p.id);
       } catch (e) {
-        debugPrint('[chat] restoreMessages failed: $e');
+        debugPrint('[chat] loadFromDb failed: $e');
       }
     }
     if (!mounted) return;
@@ -96,19 +131,96 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           role: Role.assistant,
           content:
               'Oi ${p.displayName}! Eu sou SALIX. Como posso ajudar hoje?',
+          status: 'complete',
         ));
       }
     });
-    if (_messages.isNotEmpty) {
-      // best-effort; never block UI
-      // ignore: discarded_futures
-      _persistMessages();
-    }
+    // Auto-scroll to bottom (last message) on app open.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _jumpToBottom();
+    });
     // Onda 3 — wake word "Oi SALIX" só se opt-in. Best-effort; nunca crasha.
     try {
       await _maybeStartWakeWord();
     } catch (e) {
       debugPrint('[chat] maybeStartWakeWord failed: $e');
+    }
+  }
+
+  /// v7.0.0+32: load conversation history from SQLite. Migrates legacy
+  /// SharedPreferences history on first run.
+  Future<void> _loadFromDb(String personaId) async {
+    final db = ConversationDb.instance;
+    // Reap any orphan-streaming messages from a previous session that the
+    // OS killed mid-flight (mark as 'partial' so the UI shows retry).
+    try {
+      await db.reapOrphans();
+    } catch (e) {
+      debugPrint('[chat] reapOrphans failed: $e');
+    }
+    final convId = await db.openOrCreateActive(personaId);
+    _convId = convId;
+    final loaded = await db.messagesFor(convId, limit: 500);
+
+    // Legacy migration: if SQLite is empty but SharedPreferences has the
+    // v6 history blob, import it once and then forget.
+    if (loaded.isEmpty) {
+      try {
+        await _migrateLegacyHistory(personaId, convId);
+      } catch (e) {
+        debugPrint('[chat] legacy migration failed: $e');
+      }
+      final remigrated = await db.messagesFor(convId, limit: 500);
+      _messages
+        ..clear()
+        ..addAll(remigrated);
+    } else {
+      _messages
+        ..clear()
+        ..addAll(loaded);
+    }
+  }
+
+  Future<void> _migrateLegacyHistory(String personaId, int convId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = 'chat.history.$personaId.v1';
+    final raw = prefs.getString(key);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      // ignore: avoid_dynamic_calls
+      final decoded = (raw.startsWith('[')) ? raw : null;
+      if (decoded == null) return;
+    } catch (_) {}
+    // We just import each message verbatim. Streaming/partial states are
+    // dropped — we mark them as complete since the pre-v7 client didn't
+    // track lifecycle status.
+    try {
+      final parsed = jsonDecode(raw);
+      if (parsed is! List) return;
+      for (final item in parsed) {
+        if (item is Map<String, dynamic>) {
+          final m = ChatMessage.fromJson(item);
+          if (m.kind == MessageKind.text) {
+            if (m.role == Role.user) {
+              await ConversationDb.instance.insertUserMessage(
+                convId: convId,
+                text: m.content,
+              );
+            } else {
+              final id = await ConversationDb.instance
+                  .insertStreamingAssistant(convId: convId);
+              await ConversationDb.instance
+                  .markComplete(messageId: id, content: m.content);
+            }
+          } else {
+            await ConversationDb.instance.insertNonText(convId: convId, m: m);
+          }
+        }
+      }
+      await prefs.remove(key);
+    } catch (e) {
+      debugPrint('[chat] legacy parse failed: $e');
     }
   }
 
@@ -169,63 +281,31 @@ class _ChatPageState extends ConsumerState<ChatPage> {
 
   @override
   void dispose() {
+    // v7.0.0+32: do NOT stop the persistent FG service in dispose() —
+    // it must keep running so background SSE never gets killed by Doze.
+    // We only flush the throttler.
+    // ignore: discarded_futures
+    _dbThrottle.flush();
+    _dbThrottle.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     _wake.stop();
     super.dispose();
   }
 
-  // -------------------------------------------------- Persistence (Wave 1 C4)
-
-  String? _persistKey(String personaId) => 'chat.history.$personaId.v1';
-
-  Future<void> _restoreMessages(String personaId) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final key = _persistKey(personaId);
-      if (key == null) return;
-      final raw = prefs.getString(key);
-      if (raw == null || raw.isEmpty) return;
-      final decoded = jsonDecode(raw);
-      if (decoded is! List) return;
-      final restored = <ChatMessage>[];
-      for (final item in decoded) {
-        if (item is Map<String, dynamic>) {
-          restored.add(ChatMessage.fromJson(item));
-        }
-      }
-      // Cap restore at 200 entries — anything older will be available on a
-      // hypothetical /api/messages call but the local cache stays small.
-      if (restored.length > 200) {
-        restored.removeRange(0, restored.length - 200);
-      }
-      _messages
-        ..clear()
-        ..addAll(restored);
-    } catch (e) {
-      // Corrupted snapshot — just start fresh.
-      // ignore: avoid_print
-      print('[chat] restore failed: $e');
-    }
-  }
-
+  // -------------------------------------------------- Persistence (v7 SQLite)
+  //
+  // v7.0.0+32: SharedPreferences blob is gone. Every mutation persists
+  // through ConversationDb directly:
+  //   - user msg     -> insertUserMessage()
+  //   - asst start   -> insertStreamingAssistant()
+  //   - asst delta   -> AssistantContentThrottler (500ms)
+  //   - asst done    -> markComplete()
+  //   - asst partial -> markPartial() (NEVER appends "(interrompida)")
+  //   - tool/artifact-> insertNonText()
+  //
+  // _persistMessages() kept as a noop alias for callers that still call it.
   Future<void> _persistMessages() async {
-    final p = _persona;
-    if (p == null) return;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final key = _persistKey(p.id);
-      if (key == null) return;
-      // Only persist text + tool/artifact bubbles. Drop transient streaming
-      // state (the streaming flag isn't stored — content is the truth).
-      final tail = _messages.length > 200
-          ? _messages.sublist(_messages.length - 200)
-          : _messages;
-      final encoded =
-          jsonEncode(tail.map((m) => m.toJson()).toList(growable: false));
-      await prefs.setString(key, encoded);
-    } catch (e) {
-      // ignore: avoid_print
-      print('[chat] persist failed: $e');
-    }
+    // intentionally empty — every mutation already hit SQLite synchronously.
   }
 
   // ------------------------------------------------------------------ Send
@@ -238,15 +318,43 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     final p = _persona;
     if (p == null) return;
 
+    // Make sure we have an active conversation in SQLite.
+    final convId = _convId ??
+        await ConversationDb.instance.openOrCreateActive(p.id);
+    _convId = convId;
+
     // v2.1.0: hold ChatMessage references directly instead of indexes.
-    // Indexes are invalidated when _messages is mutated by other paths
-    // (clear, _restoreMessages, persona switch, parallel _send) — that
-    // caused RangeError "Only valid value is 0: 2" reported via
-    // CrashReporter on v2.0.0+21.
-    final userMsg = ChatMessage(role: Role.user, content: text);
-    final assistantMsg = ChatMessage(role: Role.assistant, content: '');
+    final userMsg = ChatMessage(role: Role.user, content: text, status: 'complete');
+    final assistantMsg = ChatMessage(
+      role: Role.assistant,
+      content: '',
+      status: 'streaming',
+    );
 
     CrashReporter.info('_send.start');
+
+    // v7.0.0+32: persist user msg + assistant placeholder in SQLite BEFORE
+    // we start the SSE stream so a Doze kill in the middle never loses the
+    // user's question.
+    try {
+      userMsg.dbId = await ConversationDb.instance.insertUserMessage(
+        convId: convId,
+        text: text,
+      );
+      assistantMsg.dbId =
+          await ConversationDb.instance.insertStreamingAssistant(convId: convId);
+    } catch (e) {
+      debugPrint('[chat] db insert failed: $e');
+    }
+
+    // v7.0.0+32: foreground service is already persistent; we just bump
+    // the notif text so the user sees "SALIX está respondendo..." while
+    // the stream is in flight.
+    try {
+      await _chatKeepalive.bumpStreaming();
+    } catch (e) {
+      debugPrint('[chat] keepalive.bumpStreaming failed: $e');
+    }
 
     setState(() {
       _messages.add(userMsg);
@@ -270,6 +378,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     final systemPrompt = _composeSystemPrompt(p);
     _pendingContext.clear();
 
+    String? finalErrorCode;
     try {
       await for (final ev in _client.streamEvents(
         history: history,
@@ -279,39 +388,49 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         if (!mounted) return;
         switch (ev.type) {
           case StreamEventType.delta:
-            // assistantMsg is an object reference — always valid even
-            // if _messages was mutated, cleared, or shifted around.
             setState(() {
               assistantMsg.content += ev.text ?? '';
             });
+            // v7.0.0+32: persist delta to SQLite via throttler so a
+            // mid-stream OS kill leaves us with the latest content.
+            if (assistantMsg.dbId != null) {
+              _dbThrottle.update(assistantMsg.dbId!, assistantMsg.content);
+            }
             _scrollToBottom();
             break;
 
-          case StreamEventType.toolCall:
+          case StreamEventType.resetContent:
+            // v7.0.0+32: emitted by MetaAgentClient just before a transient
+            // retry. Clear partial text so the next deltas don't append to
+            // a half-broken message.
             setState(() {
-              // Insert tool-call chip just BEFORE the assistant bubble.
-              // Find current position by reference; if assistantMsg was
-              // removed (clear), append at end as best-effort.
+              assistantMsg.content = '';
+            });
+            if (assistantMsg.dbId != null) {
+              _dbThrottle.update(assistantMsg.dbId!, '');
+            }
+            break;
+
+          case StreamEventType.toolCall:
+            final chip = ChatMessage(
+              role: Role.system,
+              content: ev.toolName ?? 'tool',
+              kind: MessageKind.toolCall,
+              toolName: ev.toolName,
+              toolStatus: 'running',
+              meta: ev.raw,
+            );
+            setState(() {
               final pos = _messages.indexOf(assistantMsg);
               final insertAt = pos >= 0 ? pos : _messages.length;
-              _messages.insert(
-                insertAt,
-                ChatMessage(
-                  role: Role.system,
-                  content: ev.toolName ?? 'tool',
-                  kind: MessageKind.toolCall,
-                  toolName: ev.toolName,
-                  toolStatus: 'running',
-                  meta: ev.raw,
-                ),
-              );
+              _messages.insert(insertAt, chip);
             });
+            // ignore: discarded_futures
+            _persistChip(chip);
             _scrollToBottom();
             break;
 
           case StreamEventType.toolResult:
-            // Find the most recent matching toolCall and update it; if not
-            // found, drop a fresh result chip.
             final idx = _messages.lastIndexWhere((m) =>
                 m.kind == MessageKind.toolCall &&
                 m.toolName == ev.toolName &&
@@ -322,15 +441,14 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                 _messages[idx]
                   ..kind = MessageKind.toolResult
                   ..toolStatus = ev.toolStatus
-                  ..content = ev.text ?? (ev.toolStatus == 'ok' ? 'enviado' : 'erro')
-                  // Wave 1 / C3: keep the raw payload so the chip can show
-                  // concrete proof (email message_id, file URL, etc).
+                  ..content =
+                      ev.text ?? (ev.toolStatus == 'ok' ? 'enviado' : 'erro')
                   ..meta = ev.raw;
               } else {
                 final pos = _messages.indexOf(assistantMsg);
                 final insertAt = pos >= 0 ? pos : _messages.length;
                 _messages.insert(
-                  insertAt, // before the active assistant bubble
+                  insertAt,
                   ChatMessage(
                     role: Role.system,
                     content: ev.text ?? '',
@@ -342,25 +460,33 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                 );
               }
             });
+            // Persist the (possibly updated) chip.
+            if (idx >= 0) {
+              // ignore: discarded_futures
+              _persistChip(_messages[idx]);
+            } else {
+              // ignore: discarded_futures
+              _persistChip(_messages.last);
+            }
             _scrollToBottom();
             break;
 
           case StreamEventType.artifact:
+            final chip = ChatMessage(
+              role: Role.system,
+              content: ev.artifactLabel ?? 'Arquivo gerado',
+              kind: MessageKind.artifact,
+              artifactUrl: ev.artifactUrl,
+              artifactType: ev.artifactType,
+              meta: ev.raw,
+            );
             setState(() {
               final pos = _messages.indexOf(assistantMsg);
               final insertAt = pos >= 0 ? pos : _messages.length;
-              _messages.insert(
-                insertAt, // before active assistant bubble
-                ChatMessage(
-                  role: Role.system,
-                  content: ev.artifactLabel ?? 'Arquivo gerado',
-                  kind: MessageKind.artifact,
-                  artifactUrl: ev.artifactUrl,
-                  artifactType: ev.artifactType,
-                  meta: ev.raw,
-                ),
-              );
+              _messages.insert(insertAt, chip);
             });
+            // ignore: discarded_futures
+            _persistChip(chip);
             _scrollToBottom();
             break;
 
@@ -368,59 +494,142 @@ class _ChatPageState extends ConsumerState<ChatPage> {
             break;
 
           case StreamEventType.error:
-            if (mounted) {
-              setState(() {
-                assistantMsg.content += ev.text ?? '';
-              });
-            }
+            // v7.0.0+32: error events are status codes — they NEVER bleed
+            // into the visible content. Track the latest code so we can
+            // mark the bubble after the loop exits.
+            finalErrorCode = ev.text ?? 'unknown';
             break;
         }
       }
     } catch (e, s) {
       CrashReporter.report(e, s, context: '_send.catch');
-      assistantMsg.content += '\n[erro: $e]';
+      finalErrorCode = 'exception:$e';
     } finally {
+      // v7.0.0+32: ALWAYS flush throttled content + bump notif idle.
+      try {
+        await _dbThrottle.flush();
+      } catch (_) {}
+      try {
+        await _chatKeepalive.bumpIdle();
+      } catch (e) {
+        debugPrint('[chat] keepalive.bumpIdle failed: $e');
+      }
       // Dispatch any [OPEN_INTENT] tags then strip them.
       final cleaned = await IntentLauncher.dispatch(assistantMsg.content);
       assistantMsg.content = cleaned;
+
+      // v7.0.0+32: assign final status based on what happened.
+      if (finalErrorCode == null) {
+        assistantMsg.status = 'complete';
+        if (assistantMsg.dbId != null) {
+          // ignore: discarded_futures
+          ConversationDb.instance.markComplete(
+            messageId: assistantMsg.dbId!,
+            content: assistantMsg.content,
+          );
+        }
+      } else if (finalErrorCode == 'user_canceled') {
+        assistantMsg.status = 'partial';
+        if (assistantMsg.dbId != null) {
+          // ignore: discarded_futures
+          ConversationDb.instance.markPartial(
+            messageId: assistantMsg.dbId!,
+            content: assistantMsg.content,
+          );
+        }
+      } else {
+        assistantMsg.status = 'failed';
+        if (assistantMsg.dbId != null) {
+          // ignore: discarded_futures
+          ConversationDb.instance.markFailed(
+            messageId: assistantMsg.dbId!,
+            content: assistantMsg.content,
+          );
+        }
+      }
+
       if (mounted) setState(() => _streaming = false);
-      // Persist the final history to disk so opening the app later restores
-      // exactly what the user sees right now (Wave 1 / C4).
-      await _persistMessages();
-      // Speak final text in the persona's language and chosen voice gender.
-      // Skip if the response was canceled (just an "[interrompido]" marker).
-      if (!cleaned.trim().endsWith('[interrompido]')) {
+
+      // Speak final text only if we actually got a complete response.
+      if (assistantMsg.status == 'complete' && cleaned.trim().isNotEmpty) {
         _voice.speak(
           cleaned,
           lang: p.voice,
           gender: p.voiceGender,
         );
       }
-      CrashReporter.info('_send.done');
+      CrashReporter.info('_send.done status=${assistantMsg.status}');
     }
   }
 
+  /// v7.0.0+32: persist a tool/artifact chip to SQLite (best-effort).
+  Future<void> _persistChip(ChatMessage m) async {
+    final cid = _convId;
+    if (cid == null) return;
+    if (m.dbId != null) return; // already persisted (toolResult update path)
+    try {
+      m.dbId = await ConversationDb.instance.insertNonText(convId: cid, m: m);
+    } catch (e) {
+      debugPrint('[chat] persist chip failed: $e');
+    }
+  }
+
+  /// Retry a failed/partial assistant message. Re-runs _send() with the
+  /// original user prompt that immediately preceded the failed bubble.
+  Future<void> _retryMessage(ChatMessage failed) async {
+    if (_streaming) return;
+    final idx = _messages.indexOf(failed);
+    if (idx <= 0) return;
+    // Walk backwards for the most recent user text.
+    String? userText;
+    for (int i = idx - 1; i >= 0; i--) {
+      final m = _messages[i];
+      if (m.role == Role.user && m.kind == MessageKind.text) {
+        userText = m.content;
+        break;
+      }
+    }
+    if (userText == null || userText.isEmpty) return;
+    // Drop the failed bubble (and any tool chips between it and the user msg)
+    // so the retry produces a clean response.
+    setState(() {
+      _messages.removeAt(idx);
+    });
+    if (failed.dbId != null) {
+      try {
+        await ConversationDb.instance.markFailed(
+          messageId: failed.dbId!,
+          content: failed.content,
+        );
+      } catch (_) {}
+    }
+    await _send(userText);
+  }
+
   /// User pressed STOP — abort the in-flight stream. The MetaAgentClient
-  /// closes its http.Client, which propagates a tear-down to the server, and
-  /// the server's r.Context() cancels the upstream request to the meta-adapter.
+  /// closes its http.Client, which propagates a tear-down to the server.
+  ///
+  /// v7.0.0+32: NEVER appends "(interrompido)" to the visible content.
+  /// The bubble shows whatever partial text we already streamed, plus a
+  /// "↻ tentar novamente" button (rendered by _Bubble when status='partial').
   void _stopStream() {
     if (!_streaming) return;
     _client.cancel();
     _voice.stopSpeaking();
+    // v7.0.0+32: keep the persistent FG service alive — only bump notif
+    // back to idle. The _send() finally block will mark the bubble as
+    // partial and persist it.
+    // ignore: discarded_futures
+    _chatKeepalive.bumpIdle();
+    // Tag the active assistant bubble visually as paused; final status is
+    // assigned in _send()'s finally block when the SSE loop exits.
     setState(() {
-      _streaming = false;
-      // Mark the active assistant bubble as interrupted so the user sees
-      // immediate feedback (the SSE error event will arrive a moment later
-      // and append "[interrompido]").
       if (_messages.isNotEmpty &&
           _messages.last.role == Role.assistant &&
           _messages.last.kind == MessageKind.text) {
-        if (!_messages.last.content.contains('[interrompido')) {
-          _messages.last.content += '\n_(interrompido)_';
-        }
+        _messages.last.status = 'partial';
       }
     });
-    _persistMessages();
   }
 
   /// Builds the system prompt for the next turn, optionally appending
@@ -527,6 +736,32 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     });
   }
 
+  /// v7.0.0+32: instant jump (no animation) — used on app resume so the
+  /// user sees the most recent message immediately.
+  void _jumpToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      }
+    });
+  }
+
+  Future<void> _openSearch() async {
+    final result = await Navigator.of(context).push<ConversationOpenRequest?>(
+      MaterialPageRoute(
+        builder: (_) => ConversationSearchPage(
+          personaIdHint: _persona?.id,
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+    // For now we only support 1 active conversation per persona, so just
+    // highlight the message. (Multi-conversation switching would also live
+    // here in the future.)
+    setState(() => _highlightMessageDbId = result.messageId);
+    _jumpToBottom();
+  }
+
   Future<void> _toggleMic() async {
     if (_listening) {
       await _voice.stopListening();
@@ -577,18 +812,20 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           final voiceCmd = await IntentLauncher.handleVoiceCommand(s);
           if (voiceCmd.matched) {
             // Mostra na UI um chip "🎙️ comando executado" pra feedback visual.
+            final chip = ChatMessage(
+              role: Role.system,
+              content: voiceCmd.spokenFeedback ?? 'comando executado',
+              kind: MessageKind.toolResult,
+              toolName: 'voice_command',
+              toolStatus: 'ok',
+              meta: {'transcript': s},
+            );
             setState(() {
-              _messages.add(ChatMessage(
-                role: Role.system,
-                content: voiceCmd.spokenFeedback ?? 'comando executado',
-                kind: MessageKind.toolResult,
-                toolName: 'voice_command',
-                toolStatus: 'ok',
-                meta: {'transcript': s},
-              ));
+              _messages.add(chip);
             });
             _scrollToBottom();
-            await _persistMessages();
+            // ignore: discarded_futures
+            _persistChip(chip);
             // TTS feedback
             if (voiceCmd.spokenFeedback != null) {
               _voice.speak(
@@ -643,6 +880,11 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         ),
         actions: [
           IconButton(
+            tooltip: 'Buscar nas conversas',
+            icon: const Icon(Icons.search),
+            onPressed: _openSearch,
+          ),
+          IconButton(
             tooltip: 'Configurações',
             icon: const Icon(Icons.settings),
             onPressed: () async {
@@ -671,14 +913,33 @@ class _ChatPageState extends ConsumerState<ChatPage> {
             },
           ),
           IconButton(
-            tooltip: 'Limpar',
+            tooltip: 'Nova conversa',
             icon: const Icon(Icons.delete_sweep),
-            onPressed: () {
+            onPressed: () async {
+              // v7.0.0+32: "Limpar" agora cria nova conversa SQLite (preserva
+              // historico antigo no banco — busca ainda acha). Fluxo: usuario
+              // ainda ve o feed limpo na UI, mas nada eh deletado do disco.
+              final p = _persona;
+              if (p != null) {
+                try {
+                  _convId = await ConversationDb.instance.newConversation(p.id);
+                } catch (e) {
+                  debugPrint('[chat] newConversation failed: $e');
+                }
+              }
+              if (!mounted) return;
               setState(() {
                 _messages.clear();
                 _pendingContext.clear();
+                if (p != null) {
+                  _messages.add(ChatMessage(
+                    role: Role.assistant,
+                    content:
+                        'Nova conversa iniciada. O que voce quer fazer?',
+                    status: 'complete',
+                  ));
+                }
               });
-              _persistMessages(); // wipe disk too
             },
           ),
         ],
@@ -701,6 +962,8 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                   );
                 }
                 final m = _messages[i];
+                final isHighlighted =
+                    _highlightMessageDbId != null && _highlightMessageDbId == m.dbId;
                 return _Bubble(
                   role: m.role,
                   text: m.content,
@@ -710,6 +973,13 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                       m.kind == MessageKind.text,
                   persona: p,
                   message: m,
+                  highlighted: isHighlighted,
+                  onRetry: (m.role == Role.assistant &&
+                          m.kind == MessageKind.text &&
+                          (m.status == 'partial' || m.status == 'failed') &&
+                          !_streaming)
+                      ? () => _retryMessage(m)
+                      : null,
                 );
               },
             ),
@@ -809,12 +1079,16 @@ class _Bubble extends StatelessWidget {
   final bool streaming;
   final Persona? persona;
   final ChatMessage? message;
+  final bool highlighted;
+  final VoidCallback? onRetry;
   const _Bubble({
     required this.role,
     required this.text,
     required this.streaming,
     required this.persona,
     this.message,
+    this.highlighted = false,
+    this.onRetry,
   });
 
   @override
@@ -905,9 +1179,14 @@ class _Bubble extends StatelessWidget {
     }
 
     final isUser = role == Role.user;
-    final bubbleColor =
-        isUser ? IronTheme.cyan.withOpacity(0.12) : IronTheme.bgElev;
-    final borderColor = isUser ? IronTheme.cyan : IronTheme.magenta;
+    final bubbleColor = highlighted
+        ? IronTheme.magenta.withOpacity(0.20)
+        : (isUser ? IronTheme.cyan.withOpacity(0.12) : IronTheme.bgElev);
+    Color borderColor = isUser ? IronTheme.cyan : IronTheme.magenta;
+    if (highlighted) borderColor = IronTheme.magenta;
+    if (message?.status == 'partial' || message?.status == 'failed') {
+      borderColor = IronTheme.fgDim;
+    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -928,7 +1207,9 @@ class _Bubble extends StatelessWidget {
               decoration: BoxDecoration(
                 color: bubbleColor,
                 borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: borderColor.withOpacity(0.4)),
+                border: Border.all(
+                    color: borderColor.withOpacity(highlighted ? 0.9 : 0.4),
+                    width: highlighted ? 2 : 1),
               ),
               child: text.isEmpty && streaming
                   ? const SizedBox(
@@ -936,7 +1217,30 @@ class _Bubble extends StatelessWidget {
                       width: 18,
                       child: CircularProgressIndicator(
                           strokeWidth: 2.2, color: IronTheme.cyan))
-                  : Column(
+                  : (text.isEmpty && onRetry != null)
+                      ? InkWell(
+                          onTap: onRetry,
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                                horizontal: 4, vertical: 2),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.refresh,
+                                    size: 16, color: IronTheme.magenta),
+                                SizedBox(width: 6),
+                                Text(
+                                  'tentar novamente',
+                                  style: TextStyle(
+                                    color: IronTheme.magenta,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      : Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -986,6 +1290,31 @@ class _Bubble extends StatelessWidget {
                                     ),
                                   ),
                                 ),
+                                if (onRetry != null) ...[
+                                  const SizedBox(width: 8),
+                                  InkWell(
+                                    onTap: onRetry,
+                                    child: const Padding(
+                                      padding: EdgeInsets.symmetric(
+                                          horizontal: 6, vertical: 2),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(Icons.refresh,
+                                              size: 16, color: IronTheme.magenta),
+                                          SizedBox(width: 4),
+                                          Text(
+                                            'tentar novamente',
+                                            style: TextStyle(
+                                              color: IronTheme.magenta,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ],
                             ),
                           ),

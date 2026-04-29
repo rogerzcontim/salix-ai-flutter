@@ -5,7 +5,7 @@ import 'package:http/http.dart' as http;
 import '../models/message.dart';
 
 /// Type of stream event yielded by [MetaAgentClient.streamEvents].
-enum StreamEventType { delta, toolCall, toolResult, artifact, done, error }
+enum StreamEventType { delta, toolCall, toolResult, artifact, done, error, resetContent }
 
 /// One event emitted by the SSE stream.
 class StreamEvent {
@@ -69,6 +69,19 @@ class StreamEvent {
         artifactType = null,
         artifactLabel = null,
         raw = null;
+
+  /// v7.0.0+32: emitted right before a retry attempt. The chat_page should
+  /// clear the partial assistant content so the next stream starts from a
+  /// clean slate (avoids duplicated text on transient retries).
+  StreamEvent.resetContent()
+      : type = StreamEventType.resetContent,
+        text = null,
+        toolName = null,
+        toolStatus = null,
+        artifactUrl = null,
+        artifactType = null,
+        artifactLabel = null,
+        raw = null;
 }
 
 /// SSE client for `/api/meta-agent/run` (meta-agent integrador on :9237 via nginx).
@@ -94,10 +107,21 @@ class MetaAgentClient {
   /// can call [cancel] to abort streaming (Wave 1 / C1 STOP button).
   http.Client? _activeClient;
 
+  /// True while the user pressed STOP (do NOT auto-retry).
+  bool _userCanceled = false;
+
+  /// v7.0.0+32: retry tuning. We retry up to 3x on transient network errors,
+  /// then surface a SILENT error (status=failed) — chat_page shows a
+  /// "↻ tentar novamente" button instead of an "(interrompida)" message.
+  static const int _maxRetries = 3;
+  static const Duration _retryBaseDelay = Duration(seconds: 1);
+  static const Duration _streamHardTimeout = Duration(seconds: 90);
+
   /// Aborts any in-flight stream. Closing the http.Client tears the connection
   /// down, which propagates client-side cancel to the SSE listener (LineSplitter
   /// errors out, the catch in streamEvents emits an error event and exits).
   void cancel() {
+    _userCanceled = true;
     final c = _activeClient;
     _activeClient = null;
     try {
@@ -121,17 +145,146 @@ class MetaAgentClient {
     )) {
       if (ev.type == StreamEventType.delta && ev.text != null) {
         yield ev.text!;
-      } else if (ev.type == StreamEventType.error && ev.text != null) {
-        yield ev.text!;
       }
+      // v7.0.0+32: error events are status codes ("user_canceled",
+      // "FATAL:..."), not user-visible text. Drop them silently here —
+      // callers that care use streamEvents() and inspect the code.
     }
   }
 
   /// Rich event stream: deltas + tool calls + tool results + artifacts.
+  ///
+  /// v6.0.0+31: resilient against screen-lock kills (Samsung One UI Doze).
+  /// Wraps a single attempt in [_streamOnce] and retries up to [_maxRetries]
+  /// times on mid-stream network failures. The server doesn't support resume
+  /// cursors, so each retry re-issues the original POST. The UI is signalled
+  /// via "[reconectando…]" deltas so the user sees something is happening.
   Stream<StreamEvent> streamEvents({
     required List<ChatMessage> history,
     required String systemPrompt,
     String backend = 'auto',
+    String? authToken,
+  }) async* {
+    _userCanceled = false;
+    int attempt = 0;
+    bool sawDone = false;
+
+    while (attempt <= _maxRetries && !sawDone && !_userCanceled) {
+      // Hard cap on TOTAL wall clock per call so a flaky network can't
+      // hang the UI forever.
+      // (We don't use Future.timeout on the whole stream because we need
+      // to keep yielding events as they arrive; instead we rely on the
+      // per-attempt http client timeout below.)
+      bool hadAnyEvent = false;
+      bool transient = false;
+      String? errMsg;
+
+      try {
+        await for (final ev in _streamOnce(
+          history: history,
+          systemPrompt: systemPrompt,
+          backend: backend,
+          authToken: authToken,
+        )) {
+          hadAnyEvent = true;
+          if (ev.type == StreamEventType.done) {
+            sawDone = true;
+            yield ev;
+            return;
+          }
+          if (ev.type == StreamEventType.error) {
+            // _streamOnce uses .error to signal transient drops. We swallow
+            // it here and decide retry vs surface based on error text.
+            errMsg = ev.text ?? '';
+            transient = _isTransientError(errMsg);
+            break; // exit await-for to attempt retry
+          }
+          yield ev;
+        }
+      } catch (e) {
+        // _streamOnce is supposed to convert all errors to .error events,
+        // but a Stream contract violation could still bubble up.
+        errMsg = e.toString();
+        transient = _isTransientError(errMsg);
+      }
+
+      if (sawDone) return;
+      if (_userCanceled) {
+        // v7.0.0+32: NEVER write "(interrompido)" into the visible content.
+        // The chat_page receives this error code and marks the message
+        // status=partial, showing a retry button instead.
+        yield StreamEvent.error('user_canceled');
+        return;
+      }
+
+      attempt++;
+      final canRetry = transient && attempt <= _maxRetries;
+      if (!canRetry) {
+        // Out of retries OR not a transient error. We DO NOT write any
+        // user-visible text — chat_page will read the error code and
+        // toggle the bubble into status=failed (showing "↻ tentar
+        // novamente" instead of an apology message).
+        final code = (errMsg ?? '').trim().isEmpty ? 'unknown' : (errMsg ?? '');
+        yield StreamEvent.error('FATAL:$code');
+        return;
+      }
+
+      // Reconnecting silently — no visible delta, no "interrompida"-like
+      // text. The chat_page keeps showing the spinner while we retry.
+      // We emit resetContent so the partial accumulated text is cleared
+      // before the fresh stream starts (otherwise the next deltas would
+      // append to the previous half-response).
+      yield StreamEvent.resetContent();
+      // Back off: 1s, 2s, 4s.
+      final backoff = _retryBaseDelay * (1 << (attempt - 1));
+      try {
+        await Future<void>.delayed(backoff);
+      } catch (_) {}
+      if (_userCanceled) {
+        yield StreamEvent.error('user_canceled');
+        return;
+      }
+      hadAnyEvent;
+    }
+
+    if (!sawDone && !_userCanceled) {
+      yield StreamEvent.error('FATAL:exhausted');
+    }
+  }
+
+  /// Returns true if the error looks like a transient network/Doze drop
+  /// that's worth retrying. False for HTTP 4xx, JSON parse errors, etc.
+  bool _isTransientError(String msg) {
+    if (msg.isEmpty) return true;
+    final lc = msg.toLowerCase();
+    // User-cancel marker — never retry.
+    if (lc.contains('interrompid')) return false;
+    // HTTP non-200 status codes are not transient (server-side rejection).
+    if (lc.contains('http 4') || lc.contains('http 5')) {
+      // Actually 5xx CAN be transient (server overload). Retry once.
+      if (lc.contains('http 5')) return true;
+      return false;
+    }
+    // Connection lost / Doze kill / DNS / timeout — all transient.
+    return lc.contains('socket') ||
+        lc.contains('connection') ||
+        lc.contains('closed') ||
+        lc.contains('reset') ||
+        lc.contains('timeout') ||
+        lc.contains('handshake') ||
+        lc.contains('network') ||
+        lc.contains('host lookup') ||
+        lc.contains('clientexception') ||
+        lc.contains('httpexception');
+  }
+
+  /// Performs one streaming attempt against the meta-adapter. Errors are
+  /// converted to [StreamEvent.error] for the orchestrator to inspect; this
+  /// method never throws.
+  Stream<StreamEvent> _streamOnce({
+    required List<ChatMessage> history,
+    required String systemPrompt,
+    required String backend,
     String? authToken,
   }) async* {
     final body = jsonEncode({
@@ -154,9 +307,14 @@ class MetaAgentClient {
     _activeClient = client;
     String currentEvent = 'message'; // default SSE event name
     try {
-      final resp = await client.send(req);
+      // Per-attempt connect/headers timeout — if the server doesn't even
+      // open the stream within 90s we give up and let the orchestrator
+      // retry. While streaming, individual reads are bounded by the
+      // socket-level keepalive (server sends `:` comments); a Doze kill
+      // throws via the LineSplitter, not via this timeout.
+      final resp = await client.send(req).timeout(_streamHardTimeout);
       if (resp.statusCode != 200) {
-        yield StreamEvent.error('\n[erro: HTTP ${resp.statusCode}]');
+        yield StreamEvent.error('HTTP ${resp.statusCode}');
         return;
       }
       final stream =
@@ -200,15 +358,25 @@ class MetaAgentClient {
         final delta = _parseDelta(payload);
         if (delta != null) yield StreamEvent.delta(delta);
       }
+      // Stream ended without [DONE]. That's a transient drop — let the
+      // orchestrator decide whether to retry.
+      yield StreamEvent.error('connection closed before [DONE]');
     } catch (e) {
-      // If user pressed STOP, the client.close() above will throw a
-      // ClientException("Connection closed..."). Surface that as a clean
-      // cancel marker rather than a scary [erro de rede:...] string.
+      // If user pressed STOP, the client.close() throws ClientException.
+      // Surface as "interrompid" so the orchestrator skips retries.
       final msg = e.toString();
-      if (msg.contains('closed') || msg.contains('aborted')) {
-        yield StreamEvent.error('\n[interrompido]');
+      if (_userCanceled || msg.contains('interrompid')) {
+        yield StreamEvent.error('interrompido');
+      } else if (msg.toLowerCase().contains('closed') ||
+          msg.toLowerCase().contains('aborted')) {
+        // Could be user-cancel OR Doze kill — distinguish via _userCanceled.
+        if (_userCanceled) {
+          yield StreamEvent.error('interrompido');
+        } else {
+          yield StreamEvent.error('connection closed: $msg');
+        }
       } else {
-        yield StreamEvent.error('\n[erro de rede: $e]');
+        yield StreamEvent.error(msg);
       }
     } finally {
       try {
