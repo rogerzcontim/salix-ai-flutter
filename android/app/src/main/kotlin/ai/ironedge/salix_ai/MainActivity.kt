@@ -190,6 +190,25 @@ class MainActivity : FlutterActivity() {
                             result.error("APP_DETAILS_FAIL", t.message, null)
                         }
                     }
+                    // v10.0.0+35: pause/resume the wake-word AudioRecord
+                    // while a foreground SpeechRecognizer captures the mic.
+                    // Fixes Bug 1 (Galaxy S24 Ultra mic conflict).
+                    "pauseForForegroundMic" -> {
+                        try {
+                            WakeWordService.pausedForForeground = true
+                            result.success(true)
+                        } catch (t: Throwable) {
+                            result.error("WAKE_PAUSE_FAIL", t.message, null)
+                        }
+                    }
+                    "resumeAfterForegroundMic" -> {
+                        try {
+                            WakeWordService.pausedForForeground = false
+                            result.success(true)
+                        } catch (t: Throwable) {
+                            result.error("WAKE_RESUME_FAIL", t.message, null)
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }

@@ -64,18 +64,48 @@ class WakeWordService {
   static const MethodChannel _method = MethodChannel('salix.wake_word');
   static const EventChannel  _events = EventChannel('salix.wake_word.events');
 
+  /// v9.0.0+34: Dart-side singleton.
+  ///
+  /// Bug Roger 29/abr (Galaxy S24 Ultra v8.0.0+33): "quando ligei o wake
+  /// de novo fechou o app sozinho". Root cause: chat_page.dart and
+  /// settings_page.dart each held their own [WakeWordService()] instance
+  /// (line 32 and line 31 respectively), so when the user toggled wake
+  /// ON in settings, BOTH instances tried to subscribe to the EventChannel.
+  /// Native side has only ONE [EventSink] slot
+  /// ([WakeWordService.sink] in Kotlin), so the settings-page subscription
+  /// overwrote chat-page's. When settings popped, [onCancel] nulled the
+  /// sink while the native service was still emitting -- triggering an
+  /// unhandled NPE on the Kotlin side that took down the process.
+  ///
+  /// With a singleton, both pages share the same [_sub] and the same
+  /// [running] flag. Calling [start] when already running is a no-op
+  /// (returns true).
+  static final WakeWordService _instance = WakeWordService._internal();
+  factory WakeWordService() => _instance;
+  WakeWordService._internal();
+
   StreamSubscription? _sub;
   bool _running = false;
-  bool _supported = Platform.isAndroid; // iOS = false (limitação plataforma)
+  final bool _supported = Platform.isAndroid; // iOS = false (limitação plataforma)
+
+  /// v9.0.0+34: registered onDetected handlers, fan-out style. Both
+  /// chat_page and settings_page may register handlers (settings registers
+  /// an empty no-op just to start the service; chat registers the real
+  /// callback). We invoke ALL of them on each detection.
+  final List<Future<void> Function()> _onDetectedHandlers = [];
+  final List<void Function(WakeWordEvent)> _onEventHandlers = [];
 
   bool get supported => _supported;
   bool get running => _running;
 
   /// Liga o foreground service e começa a escutar wake word "Oi SALIX".
   ///
-  /// [onDetected] é chamado UMA VEZ a cada detecção; depois do callback,
-  /// o service continua escutando (mas pode-se chamar [stop()] dentro do
-  /// callback se quiser ouvir só uma vez).
+  /// [onDetected] é chamado a cada detecção; o service continua
+  /// escutando depois (chame [stop] para liberar o microfone).
+  ///
+  /// v9.0.0+34: idempotent. Multiple callers (chat_page, settings_page)
+  /// can call [start] independently; subsequent calls just register
+  /// additional handlers on the same singleton EventChannel subscription.
   Future<bool> start({
     required Future<void> Function() onDetected,
     void Function(WakeWordEvent)? onEvent,
@@ -87,34 +117,58 @@ class WakeWordService {
       ));
       return false;
     }
+
+    // Register handlers FIRST so even if the service was already running,
+    // the new handler wires up.
+    _onDetectedHandlers.add(onDetected);
+    if (onEvent != null) _onEventHandlers.add(onEvent);
+
     if (_running) return true;
 
     try {
       final ok = await _method.invokeMethod<bool>('start');
       _running = ok ?? false;
-      if (!_running) return false;
+      if (!_running) {
+        // Don't keep stale handlers if start failed.
+        _onDetectedHandlers.remove(onDetected);
+        if (onEvent != null) _onEventHandlers.remove(onEvent);
+        return false;
+      }
 
-      _sub = _events.receiveBroadcastStream().listen((raw) async {
+      // v9.0.0+34: SINGLE shared subscription. Native side has only one
+      // EventSink slot; multiple Dart .listen() calls would clobber each
+      // other on the Kotlin side and crash the process.
+      _sub ??= _events.receiveBroadcastStream().listen((raw) async {
         if (raw is Map) {
           final ev = WakeWordEvent.fromMap(raw);
-          onEvent?.call(ev);
+          // Fan out to all event handlers (defensive copy in case a
+          // handler mutates the list).
+          for (final h in List.of(_onEventHandlers)) {
+            try { h(ev); } catch (_) {}
+          }
           if (ev.type == 'detected') {
-            try {
-              await onDetected();
-            } catch (e, st) {
-              if (kDebugMode) {
-                debugPrint('[wakeword] onDetected threw: $e\n$st');
+            for (final h in List.of(_onDetectedHandlers)) {
+              try {
+                await h();
+              } catch (e, st) {
+                if (kDebugMode) {
+                  debugPrint('[wakeword] onDetected handler threw: $e\n$st');
+                }
               }
             }
           }
         }
       }, onError: (e) {
-        onEvent?.call(WakeWordEvent(type: 'error', message: '$e'));
+        for (final h in List.of(_onEventHandlers)) {
+          try { h(WakeWordEvent(type: 'error', message: '$e')); } catch (_) {}
+        }
       });
 
       return true;
     } on PlatformException catch (e) {
       _running = false;
+      _onDetectedHandlers.remove(onDetected);
+      if (onEvent != null) _onEventHandlers.remove(onEvent);
       onEvent?.call(WakeWordEvent(
         type: 'error',
         message: 'PlatformException: ${e.code} ${e.message}',
@@ -122,19 +176,86 @@ class WakeWordService {
       return false;
     } catch (e) {
       _running = false;
+      _onDetectedHandlers.remove(onDetected);
+      if (onEvent != null) _onEventHandlers.remove(onEvent);
       onEvent?.call(WakeWordEvent(type: 'error', message: '$e'));
       return false;
     }
   }
 
   /// Para o foreground service e libera o microfone.
+  ///
+  /// v9.0.0+34: clears ALL fan-out handlers and tears down the singleton
+  /// EventChannel subscription. Only call this when the user explicitly
+  /// disables wake word in settings (toggle OFF). chat_page.dispose()
+  /// also calls this, but the runtime will tear down the whole process
+  /// in that case anyway.
   Future<void> stop() async {
     try {
       await _method.invokeMethod('stop');
     } catch (_) {}
-    await _sub?.cancel();
+    try {
+      await _sub?.cancel();
+    } catch (_) {}
     _sub = null;
     _running = false;
+    _onDetectedHandlers.clear();
+    _onEventHandlers.clear();
+  }
+
+  /// v10.0.0+35: PAUSE the wake-word AudioRecord temporarily so a foreground
+  /// VoiceService.startListening() can grab the mic without competing for
+  /// the AudioSource slot. Returns true if the native side acknowledged.
+  ///
+  /// Bug Roger 29/abr (Galaxy S24 Ultra): "nao esta permitindo gravar
+  /// mensagem de voz". Root cause: WakeWordService holds an AudioRecord on
+  /// VOICE_RECOGNITION; on Samsung One UI a second AudioRecord init for
+  /// SpeechRecognizer fails silently (returns no result, no callback). We
+  /// pause the wake word loop, let STT capture, then resume.
+  Future<bool> pauseForForegroundMic() async {
+    if (!_supported) return true;
+    try {
+      final r = await _method.invokeMethod<bool>('pauseForForegroundMic');
+      return r ?? false;
+    } catch (e) {
+      if (kDebugMode) debugPrint('[wakeword] pauseForForegroundMic failed: $e');
+      return false;
+    }
+  }
+
+  /// v10.0.0+35: RESUME wake-word listening after a foreground STT session.
+  /// Idempotent — safe to call even if pauseForForegroundMic() wasn't.
+  Future<bool> resumeAfterForegroundMic() async {
+    if (!_supported) return true;
+    try {
+      final r = await _method.invokeMethod<bool>('resumeAfterForegroundMic');
+      return r ?? false;
+    } catch (e) {
+      if (kDebugMode) debugPrint('[wakeword] resumeAfterForegroundMic failed: $e');
+      return false;
+    }
+  }
+
+  /// v10.0.0+35: force-restart the FG service. Used by settings toggle when
+  /// the Dart-side `running` flag may be stale (process was killed without
+  /// the Dart layer noticing — happens on Galaxy S24 Doze). Calling this
+  /// always invokes `stop` then `start`, regardless of [_running].
+  Future<bool> forceRestart({
+    required Future<void> Function() onDetected,
+    void Function(WakeWordEvent)? onEvent,
+  }) async {
+    if (!_supported) return false;
+    try {
+      await _method.invokeMethod('stop');
+    } catch (_) {}
+    try {
+      await _sub?.cancel();
+    } catch (_) {}
+    _sub = null;
+    _running = false;
+    _onDetectedHandlers.clear();
+    _onEventHandlers.clear();
+    return await start(onDetected: onDetected, onEvent: onEvent);
   }
 
   /// Ajusta a sensitivity (0.0..1.0). 0.5 default. Aumentar = mais detecções
@@ -198,7 +319,12 @@ class WakeWordService {
     }
     try {
       final m = await _method.invokeMethod<Map>('status');
-      return Map<String, dynamic>.from(m ?? {});
+      // v10.0.0+35: sync Dart-side flag with native ground truth so a stale
+      // `_running` flag (after Samsung Doze kill) gets corrected.
+      final native = Map<String, dynamic>.from(m ?? {});
+      final r = native['running'];
+      if (r is bool) _running = r;
+      return native;
     } catch (_) {
       return {'running': _running, 'supported': true};
     }

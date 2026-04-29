@@ -82,24 +82,35 @@ class Persona {
 
   /// System prompt — instructs SALIX to reply in the user's chosen language and
   /// keeps spoken-friendly markdown rules.
+  ///
+  /// v10.0.0+35: PT-BR LOCK STRICT. Bug Roger 29/abr (Galaxy S24 Ultra): "as
+  /// vezes fala misturado os idiomas". OSS gpt-oss-120b com persona soft
+  /// estava "vazando" inglês quando o user usava jargão técnico. Reforço:
+  ///   1. Bloco em CAPS no topo (LLMs respeitam mais).
+  ///   2. Negação explícita ("NUNCA misture com inglês").
+  ///   3. Exemplo concreto de comportamento esperado.
+  ///   4. Repetição no fim do prompt (efeito recency).
   String systemPrompt() {
     String langInstruction;
     switch (voice) {
       case 'en-US':
         langInstruction =
-            'Always reply in clear US English unless the user speaks another language first.';
+            'STRICT LANGUAGE RULE: Reply EXCLUSIVELY in clear US English. NEVER mix with Portuguese or Spanish, even if the user uses words from those languages or technical jargon. Translate ALL technical terms into English where natural. This rule is non-negotiable.';
         break;
       case 'it-IT':
         langInstruction =
-            'Rispondi sempre in italiano chiaro a meno che l\'utente non scriva in un\'altra lingua.';
+            'REGOLA LINGUA RIGIDA: Rispondi ESCLUSIVAMENTE in italiano chiaro. NON mischiare MAI con inglese o portoghese, anche se l\'utente usa parole di altre lingue. Traduci TUTTI i termini tecnici in italiano dove naturale.';
         break;
       default:
         langInstruction =
-            'Sempre responda em português do Brasil, a menos que o usuário fale em outra língua.';
+            'REGRA DE IDIOMA OBRIGATORIA: Responda EXCLUSIVAMENTE em portugues do Brasil. NUNCA misture com ingles ou espanhol, mesmo se o usuario usar termos em ingles ou jargao tecnico. Traduza TODOS os termos tecnicos para portugues sempre que natural ("deploy" -> "publicacao", "build" -> "compilacao", "log" -> "registro", "feature" -> "funcionalidade"). Esta regra nao e negociavel. Mesmo nomes proprios em ingles sao OK, mas o resto da frase 100% em portugues do Brasil.';
     }
     return '''
 Você é SALIX, assistente IA da Iron Edge AI.
+
+==============================================
 $langInstruction
+==============================================
 
 REGRAS DE CONVERSA (IMPORTANTE):
 - NUNCA inicie respostas com saudação ("Olá", "Oi", "Tudo bem"). Vai direto ao assunto.
@@ -126,6 +137,11 @@ COMANDOS POR VOZ DIRETOS (executados local sem chat):
 "abra <app>", "liga lanterna", "aumentar volume", "timer N min", "alarme HH:MM", "chamar <contato>"
 
 Áreas de interesse do usuário (use só quando relevante, NÃO mencione explicitamente): ${interests.join(", ")}
+
+==============================================
+LEMBRETE FINAL (recency reinforcement):
+$langInstruction
+==============================================
 ''';
   }
 }

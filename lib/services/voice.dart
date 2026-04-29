@@ -10,7 +10,10 @@ import 'dart:collection';
 import 'dart:convert';
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 class VoiceService {
@@ -149,12 +152,28 @@ class VoiceService {
 
   // ---------- STT ----------
 
+  /// v10.0.0+35: MethodChannel to wake-word service so we can pause its
+  /// AudioRecord while the foreground STT grabs the mic. Fixes Bug 1
+  /// (Galaxy S24 Ultra "nao esta permitindo gravar").
+  static const MethodChannel _wakeChan = MethodChannel('salix.wake_word');
+
+  /// v10.0.0+35: track last error so the chat page can surface it.
+  String? lastSttError;
+
   Future<bool> initStt() async {
     if (_sttReady) return true;
     _sttReady = await _stt.initialize(
-      onError: (_) {},
-      onStatus: (_) {},
+      onError: (e) {
+        lastSttError = '${e.errorMsg}';
+        if (kDebugMode) debugPrint('[stt] error: ${e.errorMsg} permanent=${e.permanent}');
+      },
+      onStatus: (s) {
+        if (kDebugMode) debugPrint('[stt] status: $s');
+      },
     );
+    if (!_sttReady) {
+      lastSttError = 'STT engine init failed (verifique Google App / OK Google).';
+    }
     return _sttReady;
   }
 
@@ -163,23 +182,67 @@ class VoiceService {
     required void Function(String finalText) onFinal,
     String localeId = 'pt_BR',
   }) async {
-    final ok = await initStt();
-    if (!ok) return;
-    await _stt.listen(
-      localeId: localeId,
-      listenOptions: stt.SpeechListenOptions(partialResults: true),
-      onResult: (r) {
-        if (r.finalResult) {
-          onFinal(r.recognizedWords);
-        } else {
-          onPartial(r.recognizedWords);
+    lastSttError = null;
+    // v10.0.0+35: explicit permission check (Bug 1).
+    try {
+      final st = await Permission.microphone.status;
+      if (!st.isGranted) {
+        final r = await Permission.microphone.request();
+        if (!r.isGranted) {
+          lastSttError = 'Permissao de microfone negada.';
+          return;
         }
-      },
-    );
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('[stt] perm check failed: $e');
+    }
+
+    // Pause wake-word AudioRecord BEFORE attempting to grab the mic.
+    // pauseForForegroundMic is best-effort — failure (e.g. WW not running)
+    // is fine and we proceed.
+    try {
+      await _wakeChan.invokeMethod('pauseForForegroundMic');
+    } catch (e) {
+      if (kDebugMode) debugPrint('[stt] pauseForForegroundMic failed (ok): $e');
+    }
+    // Give the wake-word service ~250ms to actually release the recorder.
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+
+    final ok = await initStt();
+    if (!ok) {
+      // Resume wake word if init failed.
+      try { await _wakeChan.invokeMethod('resumeAfterForegroundMic'); } catch (_) {}
+      return;
+    }
+    try {
+      await _stt.listen(
+        localeId: localeId,
+        listenOptions: stt.SpeechListenOptions(partialResults: true),
+        onResult: (r) {
+          if (r.finalResult) {
+            onFinal(r.recognizedWords);
+          } else {
+            onPartial(r.recognizedWords);
+          }
+        },
+      );
+    } catch (e) {
+      lastSttError = 'STT.listen falhou: $e';
+      if (kDebugMode) debugPrint('[stt] listen failed: $e');
+      try { await _wakeChan.invokeMethod('resumeAfterForegroundMic'); } catch (_) {}
+    }
   }
 
   Future<void> stopListening() async {
-    await _stt.stop();
+    try {
+      await _stt.stop();
+    } catch (_) {}
+    // v10.0.0+35: resume wake-word capture.
+    try {
+      await _wakeChan.invokeMethod('resumeAfterForegroundMic');
+    } catch (e) {
+      if (kDebugMode) debugPrint('[stt] resumeAfterForegroundMic failed: $e');
+    }
   }
 
   bool get isListening => _stt.isListening;

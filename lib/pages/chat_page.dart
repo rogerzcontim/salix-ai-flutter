@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -56,14 +57,53 @@ class _ChatPageState extends ConsumerState<ChatPage>
   bool _uploading = false;
   String _partialVoice = '';
 
+  /// v8.0.0+33: send-state hardening (Galaxy S24 Ultra typing-not-sending fix).
+  ///
+  /// Bug Roger 29/abr: "estou digitando a pergunta e nao esta enviando".
+  /// Root cause: previous _send() error path could leave _streaming=true
+  /// indefinitely (setState() guarded by `if (mounted)` -- if widget was
+  /// rebuilt mid-stream, the flag never reset). Send button silently did
+  /// nothing.
+  ///
+  /// Mitigations:
+  ///  1. _streamingSince timestamp -> watchdog forces reset after 120s.
+  ///  2. _lastSendTapAt -> debounce 200ms against accidental double-taps.
+  ///  3. _sendError -> visible chip on input bar (not modal dialog).
+  DateTime? _streamingSince;
+  DateTime? _lastSendTapAt;
+  String? _sendError;
+  Timer? _streamingWatchdog;
+
   /// v7.0.0+32: SQLite conversation id (active = most recent for persona).
+  /// v9.0.0+34: -1 means "DB is dead, running in-memory-only".
   int? _convId;
+
+  /// v9.0.0+34: when true, we render a "histórico inacessível, conversa
+  /// nova iniciada" pill at the top of the chat. Triggered when the DB
+  /// failed to open OR the file was corrupt and got renamed out of the
+  /// way (recovered_after_corruption). Roger: "erro ao abrir a conversa"
+  /// must NEVER block the app — degrade gracefully and explain.
+  bool _dbDegraded = false;
 
   /// Throttler so streaming token deltas don't hammer SQLite.
   final AssistantContentThrottler _dbThrottle = AssistantContentThrottler();
 
   /// Highlight a specific message id when arriving from search.
   int? _highlightMessageDbId;
+
+  /// v10.0.0+35: compaction guards. We only attempt compaction once per
+  /// 5-minute window to avoid hammering the LLM if every send re-checks the
+  /// counter. _compactionInFlight blocks parallel compactions.
+  DateTime? _lastCompactionAt;
+  bool _compactionInFlight = false;
+
+  /// v10.0.0+35: compaction thresholds (Roger spec):
+  ///   * trigger when raw message count > 500
+  ///   * each pass takes oldest 100 raw text msgs, compacts to a 5-bullet
+  ///     summary, deletes the source rows.
+  static const int _kCompactTriggerCount = 500;
+  static const int _kCompactBatchSize = 100;
+  static const Duration _kCompactCooldown = Duration(minutes: 5);
 
   @override
   void initState() {
@@ -150,35 +190,59 @@ class _ChatPageState extends ConsumerState<ChatPage>
 
   /// v7.0.0+32: load conversation history from SQLite. Migrates legacy
   /// SharedPreferences history on first run.
+  ///
+  /// v9.0.0+34: NEVER throws. Fully defensive — if any step fails, we
+  /// degrade gracefully to in-memory-only mode and the chat page renders
+  /// a "histórico inacessível" pill at top via [_dbDegraded] flag.
   Future<void> _loadFromDb(String personaId) async {
     final db = ConversationDb.instance;
-    // Reap any orphan-streaming messages from a previous session that the
-    // OS killed mid-flight (mark as 'partial' so the UI shows retry).
     try {
-      await db.reapOrphans();
-    } catch (e) {
-      debugPrint('[chat] reapOrphans failed: $e');
-    }
-    final convId = await db.openOrCreateActive(personaId);
-    _convId = convId;
-    final loaded = await db.messagesFor(convId, limit: 500);
-
-    // Legacy migration: if SQLite is empty but SharedPreferences has the
-    // v6 history blob, import it once and then forget.
-    if (loaded.isEmpty) {
+      // Reap any orphan-streaming messages from a previous session that the
+      // OS killed mid-flight (mark as 'partial' so the UI shows retry).
       try {
-        await _migrateLegacyHistory(personaId, convId);
+        await db.reapOrphans();
       } catch (e) {
-        debugPrint('[chat] legacy migration failed: $e');
+        debugPrint('[chat] reapOrphans failed: $e');
       }
-      final remigrated = await db.messagesFor(convId, limit: 500);
-      _messages
-        ..clear()
-        ..addAll(remigrated);
-    } else {
-      _messages
-        ..clear()
-        ..addAll(loaded);
+      final convId = await db.openOrCreateActive(personaId);
+      _convId = convId;
+      if (convId < 0) {
+        // DB is dead — in-memory mode. Signal UI.
+        if (mounted) setState(() => _dbDegraded = true);
+        _messages.clear();
+        return;
+      }
+      final loaded = await db.messagesFor(convId, limit: 500);
+
+      // Legacy migration: if SQLite is empty but SharedPreferences has the
+      // v6 history blob, import it once and then forget.
+      if (loaded.isEmpty) {
+        try {
+          await _migrateLegacyHistory(personaId, convId);
+        } catch (e) {
+          debugPrint('[chat] legacy migration failed: $e');
+        }
+        final remigrated = await db.messagesFor(convId, limit: 500);
+        _messages
+          ..clear()
+          ..addAll(remigrated);
+      } else {
+        _messages
+          ..clear()
+          ..addAll(loaded);
+      }
+      // If DB is in "recovered_after_corruption" mode, also flag the UI so
+      // user knows old history was archived (still on disk under
+      // .corrupted-{ts}.db) and a fresh DB was created.
+      if (db.lastOpenError == 'recovered_after_corruption' && mounted) {
+        setState(() => _dbDegraded = true);
+      }
+    } catch (e, st) {
+      // Defensive catch — every public method on ConversationDb is now
+      // soft-fail, but if a future change introduces a throw we still
+      // never crash the chat page.
+      debugPrint('[chat] _loadFromDb top-level failed: $e\n$st');
+      if (mounted) setState(() => _dbDegraded = true);
     }
   }
 
@@ -287,6 +351,14 @@ class _ChatPageState extends ConsumerState<ChatPage>
     // ignore: discarded_futures
     _dbThrottle.flush();
     _dbThrottle.dispose();
+    // v8.0.0+33: cancel watchdog + abort any active client to avoid leaks.
+    _streamingWatchdog?.cancel();
+    _streamingWatchdog = null;
+    try {
+      _client.cancel();
+    } catch (_) {}
+    _input.dispose();
+    _scroll.dispose();
     WidgetsBinding.instance.removeObserver(this);
     _wake.stop();
     super.dispose();
@@ -306,17 +378,112 @@ class _ChatPageState extends ConsumerState<ChatPage>
   // ------------------------------------------------------------------ Send
 
   Future<void> _send([String? overrideText]) async {
-    if (_streaming) return;
+    // v8.0.0+33: Galaxy S24 Ultra typing-not-sending hardening.
+    //
+    // 1) Self-heal stuck _streaming flag. If the previous attempt left
+    //    _streaming=true for >120s, we know it's stale (network hard timeout
+    //    is 90s, plus retries = ~7s). Reset and continue.
+    if (_streaming) {
+      final since = _streamingSince;
+      if (since != null && DateTime.now().difference(since).inSeconds > 120) {
+        debugPrint('[chat] _streaming flag stuck for >120s; force-resetting');
+        if (mounted) {
+          setState(() {
+            _streaming = false;
+            _streamingSince = null;
+          });
+        } else {
+          _streaming = false;
+          _streamingSince = null;
+        }
+      } else {
+        // Genuinely streaming. Show a brief visual feedback so the user
+        // doesn't think the app is broken.
+        if (mounted) {
+          setState(() => _sendError = 'Aguarde a resposta atual terminar...');
+          Future.delayed(const Duration(seconds: 3), () {
+            if (mounted && _sendError == 'Aguarde a resposta atual terminar...') {
+              setState(() => _sendError = null);
+            }
+          });
+        }
+        return;
+      }
+    }
+
+    // 2) Debounce: ignore rapid double-taps within 200ms.
+    final now = DateTime.now();
+    if (_lastSendTapAt != null &&
+        now.difference(_lastSendTapAt!).inMilliseconds < 200) {
+      debugPrint('[chat] _send debounced (double-tap)');
+      return;
+    }
+    _lastSendTapAt = now;
+
     final text = (overrideText ?? _input.text).trim();
-    if (text.isEmpty) return;
+    if (text.isEmpty) {
+      // 3) Visible feedback so Roger knows the tap registered.
+      if (mounted) {
+        setState(() => _sendError = 'Digite uma pergunta antes de enviar.');
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted && _sendError == 'Digite uma pergunta antes de enviar.') {
+            setState(() => _sendError = null);
+          }
+        });
+      }
+      return;
+    }
     _input.clear();
     final p = _persona;
-    if (p == null) return;
+    if (p == null) {
+      if (mounted) {
+        setState(() => _sendError = 'Persona nao carregada. Reabra o app.');
+      }
+      return;
+    }
 
-    // Make sure we have an active conversation in SQLite.
-    final convId = _convId ??
-        await ConversationDb.instance.openOrCreateActive(p.id);
-    _convId = convId;
+    // 4) Mark _streaming=true with timestamp BEFORE any await so a sync
+    //    exception in setup still leaves a known stale state we can clean up.
+    _streamingSince = now;
+    if (mounted) {
+      setState(() {
+        _streaming = true;
+        _sendError = null;
+      });
+    } else {
+      _streaming = true;
+    }
+    // Watchdog: force-reset _streaming if no completion within 120s.
+    _streamingWatchdog?.cancel();
+    _streamingWatchdog = Timer(const Duration(seconds: 120), () {
+      if (_streaming && mounted) {
+        debugPrint('[chat] watchdog firing: _streaming stuck');
+        setState(() {
+          _streaming = false;
+          _streamingSince = null;
+          _sendError = 'Conexao demorou demais. Tente novamente.';
+        });
+      }
+    });
+
+    // v9.0.0+34: NEVER abort _send() because of a DB error. ConversationDb
+    // is fully soft-fail now — openOrCreateActive returns -1 if the DB is
+    // dead, and every subsequent insert/update is a no-op. The user gets
+    // an in-memory-only chat (history won't persist this session) but the
+    // app continues working. This fixes Roger's "erro ao abrir a conversa"
+    // bug where a corrupt/locked SQLite file blocked sending entirely.
+    int convId;
+    try {
+      convId = _convId ??
+          await ConversationDb.instance.openOrCreateActive(p.id);
+      _convId = convId;
+    } catch (e, st) {
+      // Defensive: ConversationDb shouldn't throw anymore, but if it does
+      // (plugin missing on a weird Samsung build, etc.) we still proceed.
+      CrashReporter.report(e, st, context: '_send.openConv.unexpected');
+      convId = -1;
+      _convId = -1;
+    }
 
     // v2.1.0: hold ChatMessage references directly instead of indexes.
     final userMsg = ChatMessage(role: Role.user, content: text, status: 'complete');
@@ -351,27 +518,67 @@ class _ChatPageState extends ConsumerState<ChatPage>
       debugPrint('[chat] keepalive.bumpStreaming failed: $e');
     }
 
-    setState(() {
-      _messages.add(userMsg);
-      _messages.add(assistantMsg);
-      _streaming = true;
-    });
+    // v8.0.0+33: _streaming was already set true above (before convId load)
+    // so a stuck flag is impossible -- here we just append the bubbles.
+    if (mounted) {
+      setState(() {
+        _messages.add(userMsg);
+        _messages.add(assistantMsg);
+      });
+    }
     _scrollToBottom();
 
     // History is everything before the assistantMsg placeholder.
     // Filter by reference identity, not index, so concurrent mutations
     // can't shift the boundary.
-    final history = _messages
+    // v10.0.0+35: clone the LATEST user message and prepend a strict pt-BR
+    // language instruction so OSS doesn't drift into English mid-stream
+    // (Bug 4 — "as vezes fala misturado os idiomas"). Only the last user
+    // turn is mutated; older history goes through unchanged.
+    final allHist = _messages
         .where((m) =>
             !identical(m, assistantMsg) &&
             m.role != Role.system &&
             m.kind == MessageKind.text)
         .toList();
+    final history = <ChatMessage>[];
+    for (var i = 0; i < allHist.length; i++) {
+      final m = allHist[i];
+      final isLastUser = (i == allHist.length - 1) && m.role == Role.user;
+      if (!isLastUser) {
+        history.add(m);
+        continue;
+      }
+      // Wrap last user content. Locale-aware.
+      final wrapped = _wrapUserMessageForLanguageLock(p, m.content);
+      history.add(ChatMessage(
+        role: Role.user,
+        content: wrapped,
+        kind: MessageKind.text,
+        status: m.status,
+      ));
+    }
 
     // Inject extracted text from any pending attachments into the system prompt
     // for this turn only, then clear so future turns don't repeat it.
-    final systemPrompt = _composeSystemPrompt(p);
+    var systemPrompt = _composeSystemPrompt(p);
     _pendingContext.clear();
+
+    // v10.0.0+35: prepend up to 3 most-relevant compacted summaries (long-
+    // term memory). Roger spec: "compacta e coloca no banco de dados do cel
+    // assim quando precisar alguma coisa a salix puxa". Best-effort — never
+    // blocks send if retrieval fails.
+    try {
+      final memCtx = await _buildLongTermMemoryContext(p, text);
+      if (memCtx.isNotEmpty) {
+        systemPrompt = '$memCtx\n$systemPrompt';
+        debugPrint('[chat] long-term memory injected (${memCtx.length} chars)');
+      }
+    } catch (e) {
+      debugPrint('[chat] long-term memory build failed: $e');
+    }
+    // Trigger background compaction if conversation grew past threshold.
+    _maybeKickCompaction(p);
 
     String? finalErrorCode;
     try {
@@ -380,7 +587,14 @@ class _ChatPageState extends ConsumerState<ChatPage>
         systemPrompt: systemPrompt,
         backend: p.backend,
       )) {
-        if (!mounted) return;
+        // v8.0.0+33: do NOT bare-return when unmounted -- break and let the
+        // finally block reset _streaming + watchdog. Otherwise next _send()
+        // sees a stuck flag and the user can't type. Set finalErrorCode so
+        // the bubble is marked partial in SQLite (resume on app reopen).
+        if (!mounted) {
+          finalErrorCode = 'unmounted';
+          break;
+        }
         switch (ev.type) {
           case StreamEventType.delta:
             setState(() {
@@ -543,7 +757,25 @@ class _ChatPageState extends ConsumerState<ChatPage>
         }
       }
 
-      if (mounted) setState(() => _streaming = false);
+      // v8.0.0+33: ALWAYS reset streaming state, watchdog, and timestamp.
+      // Done in finally so even unhandled errors mid-stream don't leave a
+      // stuck flag (the original Galaxy S24 bug).
+      _streamingWatchdog?.cancel();
+      _streamingWatchdog = null;
+      _streamingSince = null;
+      if (mounted) {
+        setState(() {
+          _streaming = false;
+          if (finalErrorCode != null &&
+              finalErrorCode != 'user_canceled' &&
+              !finalErrorCode.startsWith('FATAL:')) {
+            // Mid-stream non-fatal error -- show subtle hint.
+            _sendError = null;
+          }
+        });
+      } else {
+        _streaming = false;
+      }
 
       // Speak final text only if we actually got a complete response.
       if (assistantMsg.status == 'complete' && cleaned.trim().isNotEmpty) {
@@ -567,6 +799,178 @@ class _ChatPageState extends ConsumerState<ChatPage>
     } catch (e) {
       debugPrint('[chat] persist chip failed: $e');
     }
+  }
+
+  // ----------------- v10.0.0+35: long-term memory (RAG-lite) -----------------
+
+  /// Retrieve up to 3 most-relevant compacted summaries for [userQuery] and
+  /// build a system message snippet that gets prepended to the next request.
+  /// Returns empty string when no summaries exist (first-time use).
+  Future<String> _buildLongTermMemoryContext(
+      Persona persona, String userQuery) async {
+    try {
+      final summaries = await ConversationDb.instance.retrieveRelevantSummaries(
+        personaId: persona.id,
+        query: userQuery,
+        limit: 3,
+      );
+      if (summaries.isEmpty) return '';
+      final buf = StringBuffer();
+      buf.writeln('# Memoria de longo prazo (conversas anteriores compactadas)');
+      buf.writeln('Use as informacoes abaixo se forem relevantes para a pergunta atual. NAO mencione que voce esta usando "memoria" — apenas use o contexto naturalmente.');
+      for (var i = 0; i < summaries.length; i++) {
+        buf.writeln('\n## Resumo ${i + 1}');
+        buf.writeln(summaries[i]);
+      }
+      buf.writeln('\n# Fim da memoria de longo prazo.\n');
+      return buf.toString();
+    } catch (e) {
+      debugPrint('[chat] build long-term memory failed: $e');
+      return '';
+    }
+  }
+
+  /// Trigger compaction if the active conversation exceeds threshold and
+  /// no compaction was performed in the last 5 min. Runs in background — the
+  /// user's send is NEVER blocked by compaction.
+  void _maybeKickCompaction(Persona persona) {
+    final cid = _convId;
+    if (cid == null || cid < 0) return;
+    if (_compactionInFlight) return;
+    final last = _lastCompactionAt;
+    if (last != null && DateTime.now().difference(last) < _kCompactCooldown) {
+      return;
+    }
+    // ignore: discarded_futures
+    _runCompaction(persona, cid);
+  }
+
+  /// Background compaction: take oldest [_kCompactBatchSize] msgs of the
+  /// conversation, ask OSS to summarize them in 5 bullets, save the summary,
+  /// delete the source rows. NEVER throws to caller. Runs without any
+  /// user-visible UI changes.
+  Future<void> _runCompaction(Persona persona, int convId) async {
+    _compactionInFlight = true;
+    try {
+      final db = ConversationDb.instance;
+      final total = await db.messageCount(convId);
+      if (total < _kCompactTriggerCount) {
+        debugPrint('[chat] compaction skipped: $total < $_kCompactTriggerCount');
+        return;
+      }
+      final oldest = await db.oldestTextMessages(convId, _kCompactBatchSize);
+      if (oldest.length < _kCompactBatchSize) {
+        debugPrint('[chat] compaction skipped: only ${oldest.length} text msgs');
+        return;
+      }
+      // Build a prompt for OSS to summarize.
+      final convoText = StringBuffer();
+      for (final row in oldest) {
+        final role = (row['role'] as String?) ?? 'unknown';
+        final content = ((row['content'] as String?) ?? '').trim();
+        if (content.isEmpty) continue;
+        // Cap each message at 800 chars to control prompt size.
+        final capped =
+            content.length > 800 ? '${content.substring(0, 800)}…' : content;
+        convoText.writeln('[$role] $capped');
+      }
+      final tsFrom = (oldest.first['ts'] as int?) ?? 0;
+      final tsTo = (oldest.last['ts'] as int?) ?? 0;
+      final ids = oldest
+          .map((r) => r['id'] as int?)
+          .whereType<int>()
+          .toList(growable: false);
+
+      final summary = await _callOssSummarize(persona, convoText.toString());
+      if (summary.trim().isEmpty) {
+        debugPrint('[chat] compaction skipped: summary empty (LLM err?)');
+        return;
+      }
+      final id = await db.insertSummaryAndPrune(
+        convId: convId,
+        personaId: persona.id,
+        tsFrom: tsFrom,
+        tsTo: tsTo,
+        content: summary.trim(),
+        messageIdsToDelete: ids,
+      );
+      if (id > 0) {
+        _lastCompactionAt = DateTime.now();
+        // Optional: refresh in-memory list to drop the now-deleted rows.
+        if (mounted) {
+          final fresh = await db.messagesFor(convId, limit: 500);
+          if (mounted) {
+            setState(() {
+              _messages
+                ..clear()
+                ..addAll(fresh);
+            });
+          }
+        }
+        debugPrint('[chat] compaction OK: summary id=$id, deleted ${ids.length} msgs');
+      }
+    } catch (e, st) {
+      debugPrint('[chat] _runCompaction failed: $e\n$st');
+    } finally {
+      _compactionInFlight = false;
+    }
+  }
+
+  /// Call OSS via meta-agent in non-streaming mode for compaction. We use a
+  /// dedicated POST so we don't disturb the main streaming chat client. On
+  /// failure returns "" — the caller silently skips compaction.
+  Future<String> _callOssSummarize(Persona persona, String convoText) async {
+    final endpoint = Uri.parse('https://ironedgeai.com/api/meta-agent/run');
+    final body = jsonEncode({
+      'stream': false,
+      'backend': 'oss',
+      'system':
+          'Voce e um compactador de conversas. RESPONDA APENAS em portugues do Brasil. Recebe uma sequencia de mensagens [user]/[assistant] e produz um resumo em 5 a 7 bullet points curtos preservando: nomes proprios, datas, decisoes tomadas, acordos, numeros importantes, comandos pedidos. NAO inclua introducao ou conclusao — somente os bullets, um por linha, comecando com "- ". Cap 800 caracteres totais.',
+      'messages': [
+        {
+          'role': 'user',
+          'content':
+              'Compacte estas mensagens em 5-7 bullets pt-BR (preserve nomes/datas/decisoes/numeros):\n\n${convoText.length > 30000 ? '${convoText.substring(0, 30000)}…' : convoText}',
+        },
+      ],
+      'tools_enabled': false,
+    });
+    try {
+      final r = await http
+          .post(
+            endpoint,
+            headers: const {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: body,
+          )
+          .timeout(const Duration(seconds: 60));
+      if (r.statusCode != 200) {
+        debugPrint('[chat] compaction LLM HTTP ${r.statusCode}: ${r.body.substring(0, r.body.length.clamp(0, 200))}');
+        return '';
+      }
+      final j = jsonDecode(utf8.decode(r.bodyBytes));
+      // Try common shapes:
+      //  1) {choices:[{message:{content:"..."}}]}
+      //  2) {content:"..."}
+      //  3) {output:"..."}
+      if (j is Map) {
+        final ch = j['choices'];
+        if (ch is List && ch.isNotEmpty) {
+          final msg = (ch.first as Map?)?['message'];
+          if (msg is Map && msg['content'] is String) {
+            return msg['content'] as String;
+          }
+        }
+        for (final k in const ['content', 'output', 'text', 'summary']) {
+          if (j[k] is String) return j[k] as String;
+        }
+      }
+    } catch (e) {
+      debugPrint('[chat] compaction LLM call failed: $e');
+    }
+    return '';
   }
 
   /// Retry a failed/partial assistant message. Re-runs _send() with the
@@ -625,6 +1029,22 @@ class _ChatPageState extends ConsumerState<ChatPage>
         _messages.last.status = 'partial';
       }
     });
+  }
+
+  /// v10.0.0+35: wrap the last user message with a strict language
+  /// instruction so OSS doesn't drift idioms (Bug 4). For pt-BR we say
+  /// "[responda obrigatoriamente em portugues do Brasil]" before the user
+  /// content. The persisted (DB) row keeps the ORIGINAL text — we only
+  /// rewrite the API payload here.
+  String _wrapUserMessageForLanguageLock(Persona p, String userContent) {
+    switch (p.voice) {
+      case 'en-US':
+        return '[reply strictly in US English] $userContent';
+      case 'it-IT':
+        return '[rispondi rigorosamente in italiano] $userContent';
+      default:
+        return '[responda obrigatoriamente em portugues do Brasil, sem misturar com ingles] $userContent';
+    }
   }
 
   /// Builds the system prompt for the next turn, optionally appending
@@ -941,6 +1361,33 @@ class _ChatPageState extends ConsumerState<ChatPage>
       ),
       body: Column(
         children: [
+          // v9.0.0+34: explainer pill when SQLite history is unavailable
+          // (corrupt file moved aside / IO error / first-time recovery).
+          // Chat still works, just doesn't persist this session.
+          if (_dbDegraded)
+            Container(
+              width: double.infinity,
+              color: IronTheme.magenta.withOpacity(0.10),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  const Icon(Icons.info_outline,
+                      size: 16, color: IronTheme.magenta),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'Histórico inacessível, conversa nova iniciada.',
+                      style: TextStyle(color: IronTheme.magenta, fontSize: 12),
+                    ),
+                  ),
+                  InkWell(
+                    onTap: () => setState(() => _dbDegraded = false),
+                    child: const Icon(Icons.close,
+                        size: 14, color: IronTheme.magenta),
+                  ),
+                ],
+              ),
+            ),
           Expanded(
             child: ListView.builder(
               controller: _scroll,
@@ -994,7 +1441,45 @@ class _ChatPageState extends ConsumerState<ChatPage>
           color: IronTheme.bgPanel,
           border: Border(top: BorderSide(color: Color(0x4400FFFF))),
         ),
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // v8.0.0+33: visible error chip on the composer (Galaxy S24 Ultra
+            // typing-not-sending fix). Tells the user EXACTLY why their tap
+            // didn't go through (vs the original silent return).
+            if (_sendError != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: IronTheme.magenta.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: IronTheme.magenta.withOpacity(0.5)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.info_outline,
+                          size: 14, color: IronTheme.magenta),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _sendError!,
+                          style: const TextStyle(
+                              color: IronTheme.magenta, fontSize: 12),
+                        ),
+                      ),
+                      InkWell(
+                        onTap: () => setState(() => _sendError = null),
+                        child: const Icon(Icons.close,
+                            size: 14, color: IronTheme.magenta),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            Row(
           children: [
             IconButton(
               tooltip: 'Anexar arquivo',
@@ -1055,6 +1540,8 @@ class _ChatPageState extends ConsumerState<ChatPage>
                     onPressed: _uploading ? null : () => _send(),
                     icon: const Icon(Icons.send, color: IronTheme.cyan),
                   ),
+          ],
+        ),
           ],
         ),
       ),

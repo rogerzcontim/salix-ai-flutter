@@ -338,7 +338,7 @@ class _CrashScreen extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               const Text(
-                'Versão: 7.0.0+32  •  endpoint: salix-ai.com/api/_crash',
+                'Versão: 10.0.0+35  •  endpoint: salix-ai.com/api/_crash',
                 style: TextStyle(color: Colors.white38, fontSize: 10),
               ),
             ],

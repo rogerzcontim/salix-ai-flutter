@@ -57,7 +57,32 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   // v3.0.0+25: blindado contra ForegroundServiceTypeException +
   // ForegroundServiceDidNotStartInTimeException native-side.
+  // v9.0.0+34: full outer try/catch so any unexpected throw (PlatformException
+  // mid-flight, MissingPlugin, NPE) NEVER takes down the activity. The
+  // singleton WakeWordService also makes this idempotent — chat_page and
+  // settings_page share one EventChannel subscription now.
   Future<void> _toggleWake(bool v) async {
+    try {
+      await _toggleWakeInner(v);
+    } catch (e, s) {
+      // If anything in the toggle flow crashes (rare since every step is
+      // already wrapped, but defense in depth), revert the UI state and
+      // tell the user. The original Galaxy S24 bug ("ligei o wake e o app
+      // fechou sozinho") happened when an uncaught exception escaped this
+      // method — the surrounding activity then died with no UI feedback.
+      CrashReporter.report(e, s, context: 'settings:toggleWake.outer');
+      if (mounted) {
+        setState(() => _wakeEnabled = !v);
+        _snack('Erro ao alternar wake word: ${e.toString().split('\n').first}');
+      }
+      try {
+        final p = await SharedPreferences.getInstance();
+        await p.setBool('wake_word.enabled', !v);
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _toggleWakeInner(bool v) async {
     if (v) {
       // STEP 1: Request RECORD_AUDIO. MUST be granted BEFORE the foreground
       // service is started; if user denies, we never touch the service.
@@ -78,15 +103,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         return;
       }
 
-      // STEP 1.5 (v3.0.0+26): aguardar Activity voltar pra RESUMED.
-      // Android 12+ proíbe startForegroundService() de Activity em background
-      // ou transition (in/inactive). Após o dialog de permission, Activity
-      // pode ainda estar em "inactive". Esperamos próximo frame + 600ms +
-      // confirmação que estamos resumed antes de chamar o native side.
+      // STEP 1.5 (v3.0.0+26 + v9.0.0+34): aguardar Activity voltar pra
+      // RESUMED. Android 12+ proibe startForegroundService() de Activity
+      // em background. Apos o dialog de permission, Activity pode ainda
+      // estar em "inactive". v9: aumentamos delay 600ms -> 1200ms na
+      // primeira ativacao (cold start, Samsung One UI mais lento).
       CrashReporter.info('settings:toggleWake.WAIT_resumed');
       await WidgetsBinding.instance.endOfFrame;
-      await Future<void>.delayed(const Duration(milliseconds: 600));
-      // double-check we're still mounted and ready
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
       if (!mounted) {
         CrashReporter.info('settings:toggleWake.UNMOUNTED_after_wait');
         return;
@@ -108,15 +132,29 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       setState(() => _wakeEnabled = true);
 
       // STEP 3: Start the service. Native side now has guaranteed mic perm
-      // and Activity is in resumed state.
+      // and Activity is in resumed state. v9.0.0+34: WakeWordService is now
+      // a Dart-side singleton; if chat_page already started it, this just
+      // registers an additional handler (no-op fan-out). Native side has
+      // an idempotency guard too — second onStartCommand returns early
+      // without restarting AudioRecord.
       try {
-        CrashReporter.info('settings:toggleWake.start.BEFORE_invoke');
-        await _wake.start(onDetected: () async {});
-        CrashReporter.info('settings:toggleWake.start.AFTER_invoke_OK');
+        CrashReporter.info('settings:toggleWake.forceRestart.BEFORE_invoke');
+        // v10.0.0+35: forceRestart instead of start. Bug Roger 29/abr — Dart
+        // side `_running` flag could be stale after a Samsung Doze kill;
+        // start() would early-return saying "already running" while the
+        // native FG service was actually dead. forceRestart calls stop+start
+        // unconditionally, guaranteeing a fresh AudioRecord on toggle ON.
+        await _wake.forceRestart(
+          onDetected: () async {},
+          onEvent: (ev) {
+            CrashReporter.info('settings:wake_event:${ev.type}:${ev.message ?? ''}');
+          },
+        );
+        CrashReporter.info('settings:toggleWake.forceRestart.AFTER_invoke_OK');
         _snack('Wake word ativado.');
       } catch (e, s) {
         CrashReporter.report(e, s, context: 'settings:toggleWake.start');
-        _snack('Falha iniciando wake word: $e');
+        _snack('Falha iniciando wake word: ${e.toString().split('\n').first}');
         // Roll back so we don't leave a stale flag.
         try {
           final p = await SharedPreferences.getInstance();
