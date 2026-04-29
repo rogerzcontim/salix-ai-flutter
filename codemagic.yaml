@@ -41,10 +41,10 @@ workflows:
           cd build/ios/iphoneos
           mkdir -p Payload
           cp -r Runner.app Payload/Runner.app
-          zip -qr "../../../SalixAI_v1.4.0.ipa" Payload
-          ls -la "../../../SalixAI_v1.4.0.ipa"
+          zip -qr "../../../SalixAI_v3.0.2.ipa" Payload
+          ls -la "../../../SalixAI_v3.0.2.ipa"
     artifacts:
-      - SalixAI_v1.4.0.ipa
+      - SalixAI_v3.0.2.ipa
       - build/ios/iphoneos/Runner.app
       - flutter_drive.log
     publishing:
