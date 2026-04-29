@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Verify Flutter (self-hosted)
-        shell: pwsh
+        shell: powershell
         run: |
           $env:Path = "$env:PATH_PREFIX;$env:Path"
           flutter --version
@@ -37,7 +37,7 @@ jobs:
           flutter doctor -v
 
       - name: Decode inputs
-        shell: pwsh
+        shell: powershell
         run: |
           $main_b64 = "${{ github.event.inputs.main_dart_b64 }}"
           $main = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($main_b64))
@@ -56,14 +56,14 @@ jobs:
           }
 
       - name: Create Flutter project
-        shell: pwsh
+        shell: powershell
         run: |
           $name = "${{ github.event.inputs.project_name }}"
           flutter create --project-name=$name --org=ai.ironedge --platforms=windows $name
           if ($LASTEXITCODE -ne 0) { throw "flutter create failed" }
 
       - name: Apply main.dart, pubspec extras, assets
-        shell: pwsh
+        shell: powershell
         run: |
           $name = "${{ github.event.inputs.project_name }}"
           $proj = Join-Path $env:GITHUB_WORKSPACE $name
@@ -91,17 +91,17 @@ jobs:
           }
 
       - name: flutter pub get
-        shell: pwsh
+        shell: powershell
         working-directory: ${{ github.event.inputs.project_name }}
         run: flutter pub get
 
       - name: flutter build windows --release
-        shell: pwsh
+        shell: powershell
         working-directory: ${{ github.event.inputs.project_name }}
         run: flutter build windows --release
 
       - name: Zip artifact
-        shell: pwsh
+        shell: powershell
         run: |
           $name = "${{ github.event.inputs.project_name }}"
           $src  = "$env:GITHUB_WORKSPACE\$name\build\windows\x64\runner\Release"
