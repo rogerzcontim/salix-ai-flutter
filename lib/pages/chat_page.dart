@@ -302,11 +302,6 @@ class _ChatPageState extends ConsumerState<ChatPage>
   //   - asst done    -> markComplete()
   //   - asst partial -> markPartial() (NEVER appends "(interrompida)")
   //   - tool/artifact-> insertNonText()
-  //
-  // _persistMessages() kept as a noop alias for callers that still call it.
-  Future<void> _persistMessages() async {
-    // intentionally empty — every mutation already hit SQLite synchronously.
-  }
 
   // ------------------------------------------------------------------ Send
 
