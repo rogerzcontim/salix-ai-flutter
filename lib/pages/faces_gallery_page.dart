@@ -21,7 +21,6 @@ class FacesGalleryPage extends StatefulWidget {
 }
 
 class _FacesGalleryPageState extends State<FacesGalleryPage> {
-  final _api = MultimodalApi();
   final _uploads = UploadService();
   final _attachments = AttachmentsService();
   bool _loading = true;

@@ -1,7 +1,7 @@
 name: salix_ai
 description: SALIX AI Personal — chat ChatGPT-style com SALIX + OSS gpt-oss-120b, voz premium XTTS-v2, wake word "Oi SALIX", multi-user, abre apps Android, anexos, câmera, controles nativos e rotinas.
 publish_to: 'none'
-version: 1.4.0+15
+version: 1.5.0+16
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
