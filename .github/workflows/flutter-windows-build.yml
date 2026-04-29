@@ -1,0 +1,122 @@
+name: Flutter Windows Build
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: 'Nome do projeto (snake_case)'
+        required: true
+        default: 'salix_app'
+      main_dart_b64:
+        description: 'lib/main.dart em base64'
+        required: true
+      pubspec_extra_b64:
+        description: 'YAML extras pra pubspec.yaml em base64 (opcional)'
+        required: false
+        default: ''
+      assets_b64:
+        description: 'JSON map {relpath: content} em base64 (opcional)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.27.4'
+
+      - name: Verify Flutter
+        shell: pwsh
+        run: |
+          flutter --version
+          flutter config --enable-windows-desktop
+          flutter doctor -v
+
+      - name: Decode inputs
+        shell: pwsh
+        run: |
+          $main_b64 = "${{ github.event.inputs.main_dart_b64 }}"
+          $main = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($main_b64))
+          [IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\main_dart.txt", $main, [Text.UTF8Encoding]::new($false))
+
+          $pe_b64 = "${{ github.event.inputs.pubspec_extra_b64 }}"
+          if ($pe_b64 -ne "") {
+            $pe = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($pe_b64))
+            [IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\pubspec_extra.txt", $pe, [Text.UTF8Encoding]::new($false))
+          }
+
+          $as_b64 = "${{ github.event.inputs.assets_b64 }}"
+          if ($as_b64 -ne "") {
+            $as = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($as_b64))
+            [IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\assets.json", $as, [Text.UTF8Encoding]::new($false))
+          }
+
+      - name: Create Flutter project
+        shell: pwsh
+        run: |
+          $name = "${{ github.event.inputs.project_name }}"
+          flutter create --project-name=$name --org=ai.ironedge --platforms=windows $name
+          if ($LASTEXITCODE -ne 0) { throw "flutter create failed" }
+
+      - name: Apply main.dart, pubspec extras, assets
+        shell: pwsh
+        run: |
+          $name = "${{ github.event.inputs.project_name }}"
+          $proj = Join-Path $env:GITHUB_WORKSPACE $name
+
+          Copy-Item "$env:GITHUB_WORKSPACE\main_dart.txt" "$proj\lib\main.dart" -Force
+
+          if (Test-Path "$env:GITHUB_WORKSPACE\pubspec_extra.txt") {
+            $pubPath = Join-Path $proj "pubspec.yaml"
+            $pub = Get-Content $pubPath -Raw
+            $extra = Get-Content "$env:GITHUB_WORKSPACE\pubspec_extra.txt" -Raw
+            $pub = $pub -replace 'dev_dependencies:', "$extra`r`ndev_dependencies:"
+            [IO.File]::WriteAllText($pubPath, $pub, [Text.UTF8Encoding]::new($false))
+          }
+
+          if (Test-Path "$env:GITHUB_WORKSPACE\assets.json") {
+            $assets = Get-Content "$env:GITHUB_WORKSPACE\assets.json" -Raw | ConvertFrom-Json
+            foreach ($prop in $assets.PSObject.Properties) {
+              $rel = $prop.Name -replace '\\.\\.[\\/\\\\]', ''
+              $rel = $rel -replace '^[\\/\\\\]', ''
+              $full = Join-Path $proj $rel
+              $dir = Split-Path $full -Parent
+              if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+              [IO.File]::WriteAllText($full, $prop.Value, [Text.UTF8Encoding]::new($false))
+            }
+          }
+
+      - name: flutter pub get
+        shell: pwsh
+        working-directory: ${{ github.event.inputs.project_name }}
+        run: flutter pub get
+
+      - name: flutter build windows --release
+        shell: pwsh
+        working-directory: ${{ github.event.inputs.project_name }}
+        run: flutter build windows --release
+
+      - name: Zip artifact
+        shell: pwsh
+        run: |
+          $name = "${{ github.event.inputs.project_name }}"
+          $src  = "$env:GITHUB_WORKSPACE\$name\build\windows\x64\runner\Release"
+          if (-not (Test-Path $src)) {
+            $src = "$env:GITHUB_WORKSPACE\$name\build\windows\runner\Release"
+          }
+          if (-not (Test-Path $src)) { throw "Release dir not found: $src" }
+          $zip = "$env:GITHUB_WORKSPACE\${name}_windows.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath $zip -Force
+          Get-Item $zip | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flutter-windows-build
+          path: ${{ github.event.inputs.project_name }}_windows.zip
+          retention-days: 7
+          if-no-files-found: error
