@@ -831,12 +831,27 @@ class _Bubble extends StatelessWidget {
             color: IronTheme.cyan,
           );
         case MessageKind.toolCall:
-          return _SystemChip(
-            icon: Icons.build_circle_outlined,
-            text: '🔧 chamando ${message!.toolName ?? 'tool'}…',
-            color: IronTheme.magenta,
-            spinning: true,
-          );
+          {
+            // v5.0.0+30 — Onda 13 PII Vault: highlight per-user encrypted memory
+            // tools with a 🔒 vault chip + LGPD tooltip.
+            final tn = message!.toolName ?? 'tool';
+            final isPii = tn.startsWith('user_pii_');
+            final label = isPii
+                ? '🔒 vault — $tn…'
+                : '🔧 chamando $tn…';
+            final chip = _SystemChip(
+              icon: isPii ? Icons.lock_outline : Icons.build_circle_outlined,
+              text: label,
+              color: isPii ? IronTheme.cyan : IronTheme.magenta,
+              spinning: !isPii,
+            );
+            return isPii
+                ? Tooltip(
+                    message: 'Memória pessoal protegida (AES-256-GCM, LGPD)',
+                    child: chip,
+                  )
+                : chip;
+          }
         case MessageKind.toolResult:
           final ok = message!.toolStatus == 'ok';
           final raw = message!.meta ?? const <String, dynamic>{};

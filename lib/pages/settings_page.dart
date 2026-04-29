@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../models/persona.dart';
 import '../services/crash_reporter.dart';
@@ -688,8 +689,35 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             leading: const Icon(Icons.info_outline),
             title: const Text('SALIX AI Personal'),
             subtitle: const Text(
-                'v3.0.0+25  •  wake word ANR fix + geo FG service unbind',
+                'v5.0.0+30  •  Onda 13 PII Vault (AES-256-GCM/LGPD) + Onda 14 CLI awareness',
                 style: TextStyle(color: IronTheme.fgDim)),
+          ),
+          const Divider(height: 1, color: Color(0x2200FFFF)),
+          // v5.0.0+30 — Onda 13 PII Vault: client-side hint that personal
+          // memory is encrypted per-user with AES-256-GCM and exportable (LGPD).
+          ListTile(
+            leading: const Icon(Icons.lock_outline, color: IronTheme.cyan),
+            title: const Text('Privacidade & memória pessoal'),
+            subtitle: const Text(
+                'Sua memória pessoal está protegida (AES-256-GCM por usuário). Você pode exportar tudo a qualquer momento (LGPD).',
+                style: TextStyle(color: IronTheme.fgDim)),
+          ),
+          // v5.0.0+30 — Onda 14: aponta o usuário Windows pro CLI salix.exe
+          // que caça arquivos no PC e cacheia paths localmente. APK/iOS não
+          // executam essas tools.
+          ListTile(
+            leading: const Icon(Icons.terminal, color: IronTheme.magenta),
+            title: const Text('CLI Windows (salix.exe v2.4.0+)'),
+            subtitle: const Text(
+                'No PC, baixe salix.exe — caça arquivos, cacheia paths e SSH configs.\nhttps://ironedgeai.com/cli/latest.json',
+                style: TextStyle(color: IronTheme.fgDim, fontSize: 12)),
+            trailing: const Icon(Icons.open_in_new, size: 16),
+            onTap: () async {
+              final uri = Uri.parse('https://ironedgeai.com/cli/latest.json');
+              if (await canLaunchUrl(uri)) {
+                await launchUrl(uri, mode: LaunchMode.externalApplication);
+              }
+            },
           ),
         ],
       ),
