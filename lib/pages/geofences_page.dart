@@ -1,11 +1,15 @@
 // SALIX onda 4 — UI Geofences
+// v2.0.0+21: chamadas Geolocator wrappadas em try/catch específico +
+// CrashReporter (mesma estratégia do location_pinger).
 
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show MissingPluginException, PlatformException;
 import 'package:geolocator/geolocator.dart';
 
 import '../models/persona.dart';
+import '../services/crash_reporter.dart';
 import '../services/persona_store.dart';
 import '../services/routines_client.dart';
 import '../theme.dart';
@@ -78,16 +82,55 @@ class _GeofencesPageState extends State<GeofencesPage> {
 
   Future<Position?> _safeCurrentPosition() async {
     try {
-      final ok = await Geolocator.isLocationServiceEnabled();
+      bool ok = false;
+      try {
+        ok = await Geolocator.isLocationServiceEnabled();
+      } on MissingPluginException catch (e, s) {
+        CrashReporter.report(e, s, context: 'geofences_page:isLocSvcEnabled.MissingPlugin');
+        return null;
+      } on PlatformException catch (e, s) {
+        CrashReporter.report(e, s, context: 'geofences_page:isLocSvcEnabled.PlatformException');
+        return null;
+      }
       if (!ok) return null;
-      var perm = await Geolocator.checkPermission();
+
+      LocationPermission perm = LocationPermission.denied;
+      try {
+        perm = await Geolocator.checkPermission();
+      } on MissingPluginException catch (e, s) {
+        CrashReporter.report(e, s, context: 'geofences_page:checkPerm.MissingPlugin');
+        return null;
+      } on PlatformException catch (e, s) {
+        CrashReporter.report(e, s, context: 'geofences_page:checkPerm.PlatformException');
+        return null;
+      }
       if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
+        try {
+          perm = await Geolocator.requestPermission();
+        } on MissingPluginException catch (e, s) {
+          CrashReporter.report(e, s, context: 'geofences_page:reqPerm.MissingPlugin');
+          return null;
+        } on PlatformException catch (e, s) {
+          CrashReporter.report(e, s, context: 'geofences_page:reqPerm.PlatformException');
+          return null;
+        }
       }
       if (perm == LocationPermission.denied ||
           perm == LocationPermission.deniedForever) return null;
-      return await Geolocator.getCurrentPosition();
-    } catch (_) {
+      try {
+        return await Geolocator.getCurrentPosition();
+      } on PlatformException catch (e, s) {
+        CrashReporter.report(e, s, context: 'geofences_page:getPos.PlatformException');
+        return null;
+      } on MissingPluginException catch (e, s) {
+        CrashReporter.report(e, s, context: 'geofences_page:getPos.MissingPlugin');
+        return null;
+      } catch (e, s) {
+        CrashReporter.report(e, s, context: 'geofences_page:getPos.unknown');
+        return null;
+      }
+    } catch (e, s) {
+      CrashReporter.report(e, s, context: 'geofences_page:safeCurrentPosition.outer');
       return null;
     }
   }
@@ -208,25 +251,122 @@ class _GeofenceEditPageState extends State<_GeofenceEditPage> {
   }
 
   Future<void> _useCurrent() async {
+    const denyMsg =
+        'Permita localização em Configurações > Apps > SALIX > Permissões';
     try {
-      var perm = await Geolocator.checkPermission();
+      // Check if location services enabled.
+      bool svc = false;
+      try {
+        svc = await Geolocator.isLocationServiceEnabled();
+      } on MissingPluginException catch (e, s) {
+        CrashReporter.report(e, s,
+            context: 'geofences_edit:isLocSvcEnabled.MissingPlugin');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text(
+                  'Plugin de localização indisponível — reinstale o app')));
+        }
+        return;
+      } on PlatformException catch (e, s) {
+        CrashReporter.report(e, s,
+            context: 'geofences_edit:isLocSvcEnabled.PlatformException');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('erro serviço localização: ${e.message}')));
+        }
+        return;
+      }
+      if (!svc) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text('Ative o GPS do aparelho e tente novamente')));
+        }
+        return;
+      }
+
+      LocationPermission perm = LocationPermission.denied;
+      try {
+        perm = await Geolocator.checkPermission();
+      } on MissingPluginException catch (e, s) {
+        CrashReporter.report(e, s,
+            context: 'geofences_edit:checkPerm.MissingPlugin');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text(
+                  'Plugin de localização indisponível — reinstale o app')));
+        }
+        return;
+      } on PlatformException catch (e, s) {
+        CrashReporter.report(e, s,
+            context: 'geofences_edit:checkPerm.PlatformException');
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(denyMsg)));
+        }
+        return;
+      }
       if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
+        try {
+          perm = await Geolocator.requestPermission();
+        } on MissingPluginException catch (e, s) {
+          CrashReporter.report(e, s,
+              context: 'geofences_edit:reqPerm.MissingPlugin');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                content: Text(
+                    'Plugin de localização indisponível — reinstale o app')));
+          }
+          return;
+        } on PlatformException catch (e, s) {
+          CrashReporter.report(e, s,
+              context: 'geofences_edit:reqPerm.PlatformException');
+          if (mounted) {
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text(denyMsg)));
+          }
+          return;
+        }
       }
       if (perm == LocationPermission.denied ||
           perm == LocationPermission.deniedForever) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('permissão de localização negada')));
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(denyMsg)));
+        }
         return;
       }
-      final pos = await Geolocator.getCurrentPosition();
+
+      Position pos;
+      try {
+        pos = await Geolocator.getCurrentPosition();
+      } on MissingPluginException catch (e, s) {
+        CrashReporter.report(e, s,
+            context: 'geofences_edit:getPos.MissingPlugin');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text(
+                  'Plugin de localização indisponível — reinstale o app')));
+        }
+        return;
+      } on PlatformException catch (e, s) {
+        CrashReporter.report(e, s,
+            context: 'geofences_edit:getPos.PlatformException');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('erro GPS: ${e.message}')));
+        }
+        return;
+      }
       setState(() {
         _lat.text = pos.latitude.toString();
         _lng.text = pos.longitude.toString();
       });
-    } catch (e) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('erro GPS: $e')));
+    } catch (e, s) {
+      CrashReporter.report(e, s, context: 'geofences_edit:useCurrent.outer');
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('erro GPS: $e')));
+      }
     }
   }
 

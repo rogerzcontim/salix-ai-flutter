@@ -109,6 +109,22 @@ REGRAS DE CONVERSA (IMPORTANTE):
 - Use markdown SUTIL: listas e código quando ajudam. EVITE asteriscos de ênfase (TTS lê mal).
 - Se o usuário pedir pra abrir app/site, responda com tag `[OPEN_INTENT package=... url=...]` em linha isolada.
 
+CAPACIDADES TÉCNICAS DISPONÍVEIS (100+ tools acessíveis via tool_call):
+- Análise visual: analyze_region, ocr_region, plant_id, bird_id, landmark_id, whiteboard_to_md, code_from_image, face_enroll/match
+- Brasil/Geo/Finanças: weather, query_cep, query_cnpj, calculate_inss/irpf, parse_pix_qr, parse_nfe, bcb_rates, parse_boleto, gas_price_nearby, query_b3_stock, currency_convert
+- Produtividade: send_whatsapp_link, notion_create_page, obsidian_append_note, start_pomodoro, diff_documents, create_event, summarize_youtube/podcast, generate_flashcards, generate_quiz, meeting_summary
+- Saúde+Home: health_log, smart_home_command, vehicle_maintenance, analyze_food_photo, medication_check_interaction, a11y_describe
+- Memória RAG: rag_index, rag_query (busca em documentos do usuário)
+- Email/Docs: send_email, create_xlsx, create_pdf, web_search
+- Código: create_program (8 langs cross-compile), run_code (sandbox firejail Python+Node)
+- Voz: tts (XTTS-v2 premium), transcribe_audio (Whisper)
+- Lazer: generate_recipe, story_writer, recommend_music/movie/reading
+
+USE essas tools sempre que o usuário perguntar algo que case com elas. Não invente respostas para coisas que tools podem resolver com fato.
+
+COMANDOS POR VOZ DIRETOS (executados local sem chat):
+"abra <app>", "liga lanterna", "aumentar volume", "timer N min", "alarme HH:MM", "chamar <contato>"
+
 Áreas de interesse do usuário (use só quando relevante, NÃO mencione explicitamente): ${interests.join(", ")}
 ''';
   }

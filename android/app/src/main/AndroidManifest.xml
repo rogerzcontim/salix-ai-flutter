@@ -24,7 +24,16 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+    <!-- v3.0.0+25: FOREGROUND_SERVICE_LOCATION removed. We only call
+         Geolocator.getCurrentPosition() (one-shot, no FG service needed).
+         Declaring this permission caused the geolocator plugin to register
+         GeolocatorLocationService with foregroundServiceType=location,
+         and on Android 14+ that service crashes the host app with
+         ForegroundServiceTypeException if FINE_LOCATION isn't granted at
+         the EXACT moment getCurrentPosition is invoked — which is exactly
+         what was happening when user toggled "Localização" or used "USAR
+         LOCALIZAÇÃO ATUAL" before granting the system dialog. -->
+    <!-- <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/> -->
     <!-- DND / Ringtone mode -->
     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY"/>
 
@@ -177,7 +186,11 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
-        <!-- Onda 3 — wake word "Oi SALIX" foreground service -->
+        <!-- Onda 3 — wake word "Oi SALIX" foreground service.
+             v1.8.0: enabled=false por default. MainActivity habilita
+             dinamicamente quando Settings -> wake_word toggle ativa. Isso
+             impede que Android tente startar o foreground service em boot
+             antes de RECORD_AUDIO ser concedido (crash silencioso). -->
         <service
             android:name=".WakeWordService"
             android:enabled="true"

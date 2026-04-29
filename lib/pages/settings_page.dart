@@ -1,8 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show MissingPluginException, PlatformException;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/persona.dart';
+import '../services/crash_reporter.dart';
+import '../services/location_pinger.dart';
 import '../services/persona_store.dart';
 import '../services/push_notifications.dart';
 import '../services/theme_controller.dart';
@@ -12,6 +17,7 @@ import 'device_controls_page.dart';
 import 'geofences_page.dart';
 import 'onboarding_page.dart';
 import 'routines_page.dart';
+import 'tools_catalog_page.dart';
 
 class SettingsPage extends ConsumerStatefulWidget {
   const SettingsPage({super.key});
@@ -25,30 +31,241 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   List<Persona> _personas = [];
   String? _activeId;
   bool _wakeEnabled = false;
+  bool _locationEnabled = false;
+  bool _voiceAlwaysOn = true; // v1.6.0: comandos universais sempre ativos
 
   @override
   void initState() {
     super.initState();
     _refresh();
-    _loadWakeEnabled();
+    _loadFlags();
   }
 
-  Future<void> _loadWakeEnabled() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _wakeEnabled = prefs.getBool('wake_word.enabled') ?? false;
-    });
+  Future<void> _loadFlags() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final loc = await LocationPinger.isEnabled();
+      if (!mounted) return;
+      setState(() {
+        _wakeEnabled = prefs.getBool('wake_word.enabled') ?? false;
+        _locationEnabled = loc;
+        _voiceAlwaysOn = prefs.getBool('voice.always_on') ?? true;
+      });
+    } catch (_) {}
   }
 
+  // v3.0.0+25: blindado contra ForegroundServiceTypeException +
+  // ForegroundServiceDidNotStartInTimeException native-side.
   Future<void> _toggleWake(bool v) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('wake_word.enabled', v);
-    setState(() => _wakeEnabled = v);
     if (v) {
-      await _wake.start(onDetected: () async {});
+      // STEP 1: Request RECORD_AUDIO. MUST be granted BEFORE the foreground
+      // service is started; if user denies, we never touch the service.
+      PermissionStatus status;
+      try {
+        CrashReporter.info('settings:toggleWake.BEFORE_request');
+        status = await Permission.microphone.request();
+        CrashReporter.info('settings:toggleWake.AFTER_request:$status');
+      } catch (e, s) {
+        CrashReporter.report(e, s, context: 'settings:toggleWake.permRequest');
+        _snack('Erro consultando permissão: $e');
+        return;
+      }
+      if (!status.isGranted) {
+        _snack(status.isPermanentlyDenied
+            ? 'Permissão bloqueada. Ative em Configurações > Apps > SALIX AI > Permissões.'
+            : 'Permissão de microfone necessária pro wake word.');
+        return;
+      }
+
+      // STEP 1.5 (v3.0.0+26): aguardar Activity voltar pra RESUMED.
+      // Android 12+ proíbe startForegroundService() de Activity em background
+      // ou transition (in/inactive). Após o dialog de permission, Activity
+      // pode ainda estar em "inactive". Esperamos próximo frame + 600ms +
+      // confirmação que estamos resumed antes de chamar o native side.
+      CrashReporter.info('settings:toggleWake.WAIT_resumed');
+      await WidgetsBinding.instance.endOfFrame;
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      // double-check we're still mounted and ready
+      if (!mounted) {
+        CrashReporter.info('settings:toggleWake.UNMOUNTED_after_wait');
+        return;
+      }
+      CrashReporter.info('settings:toggleWake.AFTER_wait_resumed');
+
+      // STEP 2: Persist flag FIRST so reboot picks it up.
+      try {
+        CrashReporter.info('settings:toggleWake.persist.BEFORE');
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('wake_word.enabled', true);
+        CrashReporter.info('settings:toggleWake.persist.AFTER');
+      } catch (e, s) {
+        CrashReporter.report(e, s, context: 'settings:toggleWake.persist');
+        _snack('Falha salvando preferência: $e');
+        return;
+      }
+      if (!mounted) return;
+      setState(() => _wakeEnabled = true);
+
+      // STEP 3: Start the service. Native side now has guaranteed mic perm
+      // and Activity is in resumed state.
+      try {
+        CrashReporter.info('settings:toggleWake.start.BEFORE_invoke');
+        await _wake.start(onDetected: () async {});
+        CrashReporter.info('settings:toggleWake.start.AFTER_invoke_OK');
+        _snack('Wake word ativado.');
+      } catch (e, s) {
+        CrashReporter.report(e, s, context: 'settings:toggleWake.start');
+        _snack('Falha iniciando wake word: $e');
+        // Roll back so we don't leave a stale flag.
+        try {
+          final p = await SharedPreferences.getInstance();
+          await p.setBool('wake_word.enabled', false);
+        } catch (_) {}
+        if (mounted) setState(() => _wakeEnabled = false);
+      }
     } else {
-      await _wake.stop();
+      // OFF path
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('wake_word.enabled', false);
+      } catch (e, s) {
+        CrashReporter.report(e, s, context: 'settings:toggleWake.persistOff');
+      }
+      try {
+        await _wake.stop();
+      } catch (e, s) {
+        CrashReporter.report(e, s, context: 'settings:toggleWake.stop');
+      }
+      if (!mounted) return;
+      setState(() => _wakeEnabled = false);
     }
+  }
+
+  // v2.0.0+21 — toggle blindado: cada chamada nativa em try/catch específico,
+  // checagens explícitas (GPS on? permissão? plugin OK?) com mensagens
+  // amigáveis em snackbar e CrashReporter pra cada falha.
+  Future<void> _toggleLocation(bool v) async {
+    try {
+      if (v) {
+        // CHECK 1: GPS habilitado?
+        bool svcOn = false;
+        try {
+          CrashReporter.info('settings:toggleLoc.BEFORE_isLocServiceEnabled');
+          svcOn = await Geolocator.isLocationServiceEnabled();
+          CrashReporter.info('settings:toggleLoc.AFTER_isLocServiceEnabled');
+        } on MissingPluginException catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:isLocServiceEnabled.MissingPlugin');
+          _snack('Plugin de localização não disponível. Reinstale o app.');
+          return;
+        } on PlatformException catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:isLocServiceEnabled.PlatformException');
+          _snack('Erro ao consultar GPS: ${e.message ?? e.code}');
+          return;
+        } catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:isLocServiceEnabled.unknown');
+          _snack('Erro inesperado consultando GPS: $e');
+          return;
+        }
+        if (!svcOn) {
+          _snack('GPS desligado. Ative a localização no celular antes.');
+          return;
+        }
+
+        // CHECK 2: permissão atual
+        LocationPermission perm = LocationPermission.denied;
+        try {
+          CrashReporter.info('settings:toggleLoc.BEFORE_checkPermission');
+          perm = await Geolocator.checkPermission();
+          CrashReporter.info('settings:toggleLoc.AFTER_checkPermission');
+        } on MissingPluginException catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:checkPermission.MissingPlugin');
+          _snack('Plugin não bindado. Reinstale o app.');
+          return;
+        } on PlatformException catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:checkPermission.PlatformException');
+          _snack('Erro Android: ${e.message ?? e.code}');
+          return;
+        } catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:checkPermission.unknown');
+          _snack('Erro: $e');
+          return;
+        }
+
+        // CHECK 3: pede permissão se for o caso
+        if (perm == LocationPermission.denied) {
+          try {
+            CrashReporter.info('settings:toggleLoc.BEFORE_requestPermission');
+            perm = await Geolocator.requestPermission();
+            CrashReporter.info('settings:toggleLoc.AFTER_requestPermission');
+          } on MissingPluginException catch (e, s) {
+            CrashReporter.report(e, s, context: 'settings:requestPermission.MissingPlugin');
+            _snack('Plugin não bindado.');
+            return;
+          } on PlatformException catch (e, s) {
+            CrashReporter.report(e, s, context: 'settings:requestPermission.PlatformException');
+            _snack('Erro Android: ${e.message ?? e.code}');
+            return;
+          } catch (e, s) {
+            CrashReporter.report(e, s, context: 'settings:requestPermission.unknown');
+            _snack('Erro: $e');
+            return;
+          }
+        }
+        if (perm == LocationPermission.deniedForever) {
+          _snack('Permissão bloqueada. Ative em Configurações > Apps > SALIX AI > Permissões > Localização.');
+          return;
+        }
+        if (perm != LocationPermission.always &&
+            perm != LocationPermission.whileInUse) {
+          _snack('Permissão de localização negada.');
+          return;
+        }
+
+        // CHECK 4 (paralelo, defensivo): permission_handler também
+        try {
+          await Permission.locationWhenInUse.request();
+        } catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:permission_handler.locationWhenInUse', isInfo: true);
+        }
+
+        // OK — liga
+        try {
+          await LocationPinger.setEnabled(true);
+        } catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:LocationPinger.setEnabled.true');
+          _snack('Falha ligando pinger: $e');
+          return;
+        }
+        if (!mounted) return;
+        setState(() => _locationEnabled = true);
+        _snack('Localização ativada.');
+      } else {
+        try {
+          await LocationPinger.setEnabled(false);
+        } catch (e, s) {
+          CrashReporter.report(e, s, context: 'settings:LocationPinger.setEnabled.false');
+        }
+        if (!mounted) return;
+        setState(() => _locationEnabled = false);
+      }
+    } catch (e, s) {
+      CrashReporter.report(e, s, context: 'settings:toggleLocation.outer');
+      _snack('Erro inesperado: $e');
+    }
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    try {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    } catch (_) {}
+  }
+
+  Future<void> _toggleVoiceAlwaysOn(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('voice.always_on', v);
+    if (!mounted) return;
+    setState(() => _voiceAlwaysOn = v);
   }
 
   Future<void> _refresh() async {
@@ -284,6 +501,73 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               onChanged: _wake.supported ? _toggleWake : null,
             ),
           ),
+          // v1.6.0 — comandos universais sempre ativos
+          Card(
+            child: SwitchListTile(
+              secondary:
+                  const Icon(Icons.bolt, color: IronTheme.magenta),
+              title: const Text('Comandos universais por voz'),
+              subtitle: const Text(
+                'Toque o mic e diga: "abra YouTube", "liga lanterna", "timer 5 minutos", etc.',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              value: _voiceAlwaysOn,
+              activeColor: IronTheme.cyan,
+              onChanged: _toggleVoiceAlwaysOn,
+            ),
+          ),
+          if (_voiceAlwaysOn)
+            Card(
+              color: IronTheme.bgPanel,
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: const [
+                    Text(
+                      'EXEMPLOS DE COMANDOS',
+                      style: TextStyle(
+                        color: IronTheme.cyan,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1.4,
+                      ),
+                    ),
+                    SizedBox(height: 8),
+                    _VoiceCmdHint('"abra YouTube"', 'lança o app'),
+                    _VoiceCmdHint('"abra Spotify"', 'ou Whatsapp, Maps, Waze, Uber, iFood'),
+                    _VoiceCmdHint('"liga lanterna"', 'ou "lanterna"'),
+                    _VoiceCmdHint('"aumenta volume"', 'também: diminui / mudo'),
+                    _VoiceCmdHint('"aumenta brilho"', 'também: diminui'),
+                    _VoiceCmdHint('"vibrar"', 'pulsa o telefone'),
+                    _VoiceCmdHint('"timer 10 minutos"', 'cria countdown'),
+                    _VoiceCmdHint('"alarme 7:30"', 'cria alarme'),
+                    _VoiceCmdHint('"chamar +5511999999999"', 'abre discador'),
+                    _VoiceCmdHint('"pesquisar receita de bolo"', 'busca no Google'),
+                    SizedBox(height: 6),
+                    Text(
+                      'Qualquer outra coisa vai pro chat com SALIX.',
+                      style:
+                          TextStyle(color: IronTheme.fgDim, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          Card(
+            child: SwitchListTile(
+              secondary:
+                  const Icon(Icons.location_on, color: IronTheme.magenta),
+              title: const Text('Localização (geofences)'),
+              subtitle: const Text(
+                'Permite rotinas baseadas em entrar/sair de locais. Default OFF.',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              value: _locationEnabled,
+              activeColor: IronTheme.cyan,
+              onChanged: _toggleLocation,
+            ),
+          ),
           const SizedBox(height: 24),
           const Divider(),
           const Text('APARÊNCIA',
@@ -346,12 +630,259 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
           const SizedBox(height: 30),
           const Divider(),
+          const SizedBox(height: 24),
+          const Divider(),
+          const Text('CAPACIDADES',
+              style: TextStyle(
+                  color: IronTheme.cyan,
+                  fontSize: 14,
+                  letterSpacing: 1.4,
+                  fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.auto_fix_high,
+                  color: IronTheme.magenta),
+              title: const Text('Capacidades SALIX'),
+              subtitle: const Text(
+                '100+ tools server-side: visão, finanças BR, RAG, email, código, voz...',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => const ToolsCatalogPage())),
+            ),
+          ),
+
+          const SizedBox(height: 24),
+          const Divider(),
+          Card(
+            child: ListTile(
+              leading:
+                  const Icon(Icons.bug_report, color: IronTheme.magenta),
+              title: const Text('Diagnóstico'),
+              subtitle: const Text(
+                'Status runtime de cada serviço (ajuda debugar boot/crash).',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+              onTap: () => _showDiagnostics(context),
+            ),
+          ),
+          // v2.0.0+21: diagnóstico GEO específico
+          Card(
+            child: ListTile(
+              leading:
+                  const Icon(Icons.gps_fixed, color: IronTheme.magenta),
+              title: const Text('Diagnóstico Geo'),
+              subtitle: const Text(
+                'Testa cada step da localização: GPS on, permissão, plugin, last fix.',
+                style: TextStyle(color: IronTheme.fgDim),
+              ),
+              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+              onTap: () => _showGeoDiagnostics(context),
+            ),
+          ),
+          const SizedBox(height: 16),
           ListTile(
             leading: const Icon(Icons.info_outline),
             title: const Text('SALIX AI Personal'),
             subtitle: const Text(
-                'v1.4.0+15  •  Onda 8: saúde + casa + veículo + iOS + tema light + PWA + push',
+                'v3.0.0+25  •  wake word ANR fix + geo FG service unbind',
                 style: TextStyle(color: IronTheme.fgDim)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showDiagnostics(BuildContext context) async {
+    final lines = <String>[];
+    lines.add('Versão: 2.0.0+21');
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      lines.add('SharedPreferences: OK');
+      lines.add('  wake_word.enabled = ${prefs.getBool('wake_word.enabled') ?? false}');
+      lines.add('  location.enabled  = ${prefs.getBool('location.enabled') ?? false}');
+      lines.add('  voice.always_on   = ${prefs.getBool('voice.always_on') ?? true}');
+      lines.add('  salix.theme       = ${prefs.getString('salix.theme') ?? '(unset, dark default)'}');
+    } catch (e) {
+      lines.add('SharedPreferences: FAIL -> $e');
+    }
+    try {
+      final st = await _wake.status();
+      lines.add('WakeWordService: $st');
+    } catch (e) {
+      lines.add('WakeWordService: FAIL -> $e');
+    }
+    try {
+      final pushOn = await PushNotificationsService.instance.isEnabled();
+      lines.add('PushNotifications.enabled: $pushOn (no-op até FCM ativo)');
+    } catch (e) {
+      lines.add('PushNotifications: FAIL -> $e');
+    }
+    try {
+      final loc = await LocationPinger.isEnabled();
+      lines.add('LocationPinger.enabled: $loc');
+    } catch (e) {
+      lines.add('LocationPinger: FAIL -> $e');
+    }
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: IronTheme.bgPanel,
+        title: const Text('Diagnóstico runtime'),
+        content: SingleChildScrollView(
+          child: Text(
+            lines.join('\n'),
+            style: const TextStyle(
+              color: IronTheme.fgBright,
+              fontFamily: 'monospace',
+              fontSize: 12,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Fechar'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // v2.0.0+21: diagnóstico GEO step-by-step. Roda cada chamada nativa
+  // isolada, captura cada exceção, mostra status numa lista. Útil pra ver
+  // exatamente onde a v1.x crashava.
+  Future<void> _showGeoDiagnostics(BuildContext context) async {
+    final lines = <String>[];
+    lines.add('=== DIAGNÓSTICO GEO ===');
+    lines.add('Versão: 2.0.0+21');
+    lines.add('');
+
+    // Step 1: SharedPreferences
+    try {
+      final p = await SharedPreferences.getInstance();
+      final loc = p.getBool('location.enabled') ?? false;
+      lines.add('[OK] SharedPrefs location.enabled = $loc');
+    } catch (e) {
+      lines.add('[FAIL] SharedPrefs: $e');
+    }
+
+    // Step 2: GPS service status
+    try {
+      final svcOn = await Geolocator.isLocationServiceEnabled();
+      lines.add('[${svcOn ? "OK" : "OFF"}] Geolocator.isLocationServiceEnabled = $svcOn');
+    } on MissingPluginException catch (e) {
+      lines.add('[FAIL] isLocServiceEnabled MissingPlugin: ${e.message}');
+    } on PlatformException catch (e) {
+      lines.add('[FAIL] isLocServiceEnabled Platform: ${e.code} ${e.message}');
+    } catch (e) {
+      lines.add('[FAIL] isLocServiceEnabled: $e');
+    }
+
+    // Step 3: Permission status
+    try {
+      final perm = await Geolocator.checkPermission();
+      lines.add('[OK] Geolocator.checkPermission = $perm');
+    } on MissingPluginException catch (e) {
+      lines.add('[FAIL] checkPermission MissingPlugin: ${e.message}');
+    } on PlatformException catch (e) {
+      lines.add('[FAIL] checkPermission Platform: ${e.code} ${e.message}');
+    } catch (e) {
+      lines.add('[FAIL] checkPermission: $e');
+    }
+
+    // Step 4: permission_handler status (paralelo)
+    try {
+      final s = await Permission.locationWhenInUse.status;
+      lines.add('[OK] permission_handler whenInUse = $s');
+    } catch (e) {
+      lines.add('[FAIL] permission_handler whenInUse: $e');
+    }
+
+    // Step 5: try last known position (NÃO requesta permissão)
+    try {
+      final last = await Geolocator.getLastKnownPosition();
+      if (last != null) {
+        lines.add('[OK] last fix: ${last.latitude.toStringAsFixed(5)},'
+            '${last.longitude.toStringAsFixed(5)} (acc ${last.accuracy.toStringAsFixed(0)}m)');
+      } else {
+        lines.add('[INFO] last fix: null (nenhuma posição em cache)');
+      }
+    } on MissingPluginException catch (e) {
+      lines.add('[FAIL] getLastKnownPosition MissingPlugin: ${e.message}');
+    } on PlatformException catch (e) {
+      lines.add('[FAIL] getLastKnownPosition Platform: ${e.code} ${e.message}');
+    } catch (e) {
+      lines.add('[FAIL] getLastKnownPosition: $e');
+    }
+
+    lines.add('');
+    lines.add('Se algo está [FAIL], reportei pro /api/_crash automaticamente.');
+
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: IronTheme.bgPanel,
+        title: const Text('Diagnóstico Geo'),
+        content: SingleChildScrollView(
+          child: Text(
+            lines.join('\n'),
+            style: const TextStyle(
+              color: IronTheme.fgBright,
+              fontFamily: 'monospace',
+              fontSize: 11,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Fechar'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _VoiceCmdHint extends StatelessWidget {
+  final String cmd;
+  final String desc;
+  const _VoiceCmdHint(this.cmd, this.desc);
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.mic, size: 14, color: IronTheme.magenta),
+          const SizedBox(width: 6),
+          Expanded(
+            child: RichText(
+              text: TextSpan(
+                children: [
+                  TextSpan(
+                    text: cmd,
+                    style: const TextStyle(
+                      color: IronTheme.fgBright,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
+                  ),
+                  TextSpan(
+                    text: '   $desc',
+                    style: const TextStyle(
+                        color: IronTheme.fgDim, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),

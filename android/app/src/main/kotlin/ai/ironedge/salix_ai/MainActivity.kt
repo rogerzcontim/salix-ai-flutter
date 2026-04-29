@@ -1,6 +1,8 @@
 package ai.ironedge.salix_ai
 
+import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
@@ -22,6 +24,19 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "start" -> {
                         try {
+                            // v1.8.0: enable service component dynamically (manifest
+                            // has android:enabled="false" by default to avoid boot
+                            // crash on devices without RECORD_AUDIO).
+                            try {
+                                val pm = packageManager
+                                val cn = ComponentName(this, WakeWordService::class.java)
+                                pm.setComponentEnabledSetting(
+                                    cn,
+                                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                                    PackageManager.DONT_KILL_APP,
+                                )
+                            } catch (_: Throwable) { /* ignore — startService still works */ }
+
                             val intent = Intent(this, WakeWordService::class.java)
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                 startForegroundService(intent)

@@ -89,21 +89,67 @@ class WakeWordService : Service() {
             return START_NOT_STICKY
         }
 
-        val notif = buildNotification("Escutando 'Oi SALIX'…")
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+ exige type explicit
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else {
-            startForeground(NOTIF_ID, notif)
+        // v3.0.0+25: ALWAYS call startForeground FIRST to satisfy Android's
+        // 5-second SLA, even if we're going to bail. Failing to do so on
+        // Android 12+ throws ForegroundServiceDidNotStartInTimeException,
+        // which is uncatchable from Dart and kills the entire process
+        // (this is the root cause of the silent crashes — PG receives no
+        // report because Dart never gets the exception).
+        val notif = buildNotification("Inicializando…")
+        var fgStarted = false
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+            fgStarted = true
+        } catch (t: Throwable) {
+            // ForegroundServiceTypeException happens if we declared
+            // foregroundServiceType=microphone but RECORD_AUDIO is denied.
+            // This is the OTHER half of the bug. We catch it explicitly
+            // and bail without re-throwing — the system will kill the
+            // service but the host app stays up.
+            Log.e(TAG, "startForeground failed: ${t.javaClass.simpleName}: ${t.message}")
+            emit("error", "startForeground falhou: ${t.javaClass.simpleName}: ${t.message}")
+            try { stopForegroundCompat() } catch (_: Throwable) {}
+            stopSelf()
+            return START_NOT_STICKY
         }
 
-        registerReceiver(batteryRx, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        // Now that we're safely foreground, check permission. If denied,
+        // tear down cleanly via stopForegroundCompat + stopSelf — no
+        // exception propagates because we already succeeded the SLA.
+        val hasMic = androidx.core.content.ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.RECORD_AUDIO,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!hasMic) {
+            Log.w(TAG, "RECORD_AUDIO not granted; tearing down wake-word service")
+            emit("error", "Permissão de microfone não concedida. Habilite RECORD_AUDIO antes do wake word.")
+            try { stopForegroundCompat() } catch (_: Throwable) {}
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "salix:wake_word").apply {
-            setReferenceCounted(false)
-            acquire()
+        try {
+            registerReceiver(batteryRx, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        } catch (t: Throwable) {
+            Log.w(TAG, "registerReceiver(battery) failed: ${t.message}")
+        }
+
+        // v3.0.0+25: WakeLock with explicit 10-minute cap to avoid StrictMode
+        // / battery-saver kills on long sessions. Wrapped in try/catch so a
+        // PowerManager failure doesn't crash the service.
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "salix:wake_word").apply {
+                setReferenceCounted(false)
+                acquire(10 * 60 * 1000L /* 10 minutes */)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "wakeLock acquire failed: ${t.message}")
+            wakeLock = null
         }
 
         running = true

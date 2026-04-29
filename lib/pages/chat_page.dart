@@ -1,15 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/message.dart';
 import '../models/persona.dart';
 import '../services/attachments.dart';
+import '../services/crash_reporter.dart';
 import '../services/intent_launcher.dart';
 import '../services/meta_agent_client.dart';
 import '../services/persona_store.dart';
@@ -19,6 +22,7 @@ import '../services/wake_word.dart';
 import '../theme.dart';
 import 'memories_page.dart';
 import 'settings_page.dart';
+import 'tools_catalog_page.dart';
 
 final _client = MetaAgentClient();
 final _voice = VoiceService();
@@ -50,19 +54,41 @@ class _ChatPageState extends ConsumerState<ChatPage> {
   @override
   void initState() {
     super.initState();
-    _load();
+    // v1.8.0: defer ALL side-effects to post-first-frame; never block initState.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        await _load();
+      } catch (e, st) {
+        debugPrint('[chat] _load failed: $e\n$st');
+      }
+    });
   }
 
   Future<void> _load() async {
-    final p = await PersonaStore().active();
+    Persona? p;
+    try {
+      p = await PersonaStore().active();
+    } catch (e) {
+      debugPrint('[chat] PersonaStore.active failed: $e');
+      p = null;
+    }
     if (p != null) {
-      await _voice.initTts(p.voice);
+      try {
+        await _voice.initTts(p.voice);
+      } catch (e) {
+        debugPrint('[chat] initTts failed: $e');
+      }
     }
     // Restore in-memory history per persona so re-opening the app feels
     // continuous (Wave 1 / C4). Each persona has its own bucket.
     if (p != null) {
-      await _restoreMessages(p.id);
+      try {
+        await _restoreMessages(p.id);
+      } catch (e) {
+        debugPrint('[chat] restoreMessages failed: $e');
+      }
     }
+    if (!mounted) return;
     setState(() {
       _persona = p;
       if (_messages.isEmpty && p != null) {
@@ -71,29 +97,74 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           content:
               'Oi ${p.displayName}! Eu sou SALIX. Como posso ajudar hoje?',
         ));
-        _persistMessages();
       }
     });
-    // Onda 3 — wake word "Oi SALIX" se opt-in
-    await _maybeStartWakeWord();
+    if (_messages.isNotEmpty) {
+      // best-effort; never block UI
+      // ignore: discarded_futures
+      _persistMessages();
+    }
+    // Onda 3 — wake word "Oi SALIX" só se opt-in. Best-effort; nunca crasha.
+    try {
+      await _maybeStartWakeWord();
+    } catch (e) {
+      debugPrint('[chat] maybeStartWakeWord failed: $e');
+    }
   }
 
   Future<void> _maybeStartWakeWord() async {
     if (!_wake.supported) return;
-    final prefs = await SharedPreferences.getInstance();
-    final enabled = prefs.getBool('wake_word.enabled') ?? false;
+    bool enabled = false;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      enabled = prefs.getBool('wake_word.enabled') ?? false;
+    } catch (_) {
+      enabled = false;
+    }
     if (!enabled) return;
-    await _wake.start(
-      onDetected: () async {
-        // Já estiver gravando, ignora; senão dispara o mic.
-        if (_listening) return;
-        if (!mounted) return;
-        await _toggleMic();
-      },
-      onEvent: (ev) {
-        // Útil pra debug; sem UI ruidosa.
-      },
-    );
+
+    // v3.0.0+25: Re-validate microphone permission BEFORE asking native
+    // side to start the foreground service. If user revoked permission
+    // at OS level (Settings > Apps > Permissions), the SharedPreferences
+    // flag may still say enabled=true. Without this guard the service
+    // launch path hits ForegroundServiceTypeException native-side and
+    // SIGKILLs the process before any Dart catch can run.
+    try {
+      final micStatus = await Permission.microphone.status;
+      if (!micStatus.isGranted) {
+        debugPrint('[chat] wake_word.enabled=true but mic perm revoked; clearing flag');
+        try {
+          final p = await SharedPreferences.getInstance();
+          await p.setBool('wake_word.enabled', false);
+        } catch (_) {}
+        return;
+      }
+    } catch (e) {
+      debugPrint('[chat] mic permission check failed: $e — skip wake word');
+      return;
+    }
+
+    try {
+      await _wake.start(
+        onDetected: () async {
+          // v2.1.0: blind concurrent triggers — RangeError on _send was
+          // caused by overlapping streams mutating _messages. Wake word
+          // must NEVER spawn a parallel _send while one is in flight.
+          if (_listening) return;
+          if (_streaming) {
+            debugPrint('[wake] ignoring detection while streaming');
+            return;
+          }
+          if (!mounted) return;
+          await _toggleMic();
+        },
+        onEvent: (ev) {
+          // Útil pra debug; sem UI ruidosa.
+        },
+      );
+    } catch (e) {
+      debugPrint('[chat] wake.start failed: $e');
+    }
   }
 
   @override
@@ -167,17 +238,31 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     final p = _persona;
     if (p == null) return;
 
+    // v2.1.0: hold ChatMessage references directly instead of indexes.
+    // Indexes are invalidated when _messages is mutated by other paths
+    // (clear, _restoreMessages, persona switch, parallel _send) — that
+    // caused RangeError "Only valid value is 0: 2" reported via
+    // CrashReporter on v2.0.0+21.
+    final userMsg = ChatMessage(role: Role.user, content: text);
+    final assistantMsg = ChatMessage(role: Role.assistant, content: '');
+
+    CrashReporter.info('_send.start');
+
     setState(() {
-      _messages.add(ChatMessage(role: Role.user, content: text));
-      _messages.add(ChatMessage(role: Role.assistant, content: ''));
+      _messages.add(userMsg);
+      _messages.add(assistantMsg);
       _streaming = true;
     });
     _scrollToBottom();
 
-    final assistantIdx = _messages.length - 1;
+    // History is everything before the assistantMsg placeholder.
+    // Filter by reference identity, not index, so concurrent mutations
+    // can't shift the boundary.
     final history = _messages
-        .sublist(0, assistantIdx)
-        .where((m) => m.role != Role.system && m.kind == MessageKind.text)
+        .where((m) =>
+            !identical(m, assistantMsg) &&
+            m.role != Role.system &&
+            m.kind == MessageKind.text)
         .toList();
 
     // Inject extracted text from any pending attachments into the system prompt
@@ -194,16 +279,23 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         if (!mounted) return;
         switch (ev.type) {
           case StreamEventType.delta:
+            // assistantMsg is an object reference — always valid even
+            // if _messages was mutated, cleared, or shifted around.
             setState(() {
-              _messages[assistantIdx].content += ev.text ?? '';
+              assistantMsg.content += ev.text ?? '';
             });
             _scrollToBottom();
             break;
 
           case StreamEventType.toolCall:
             setState(() {
+              // Insert tool-call chip just BEFORE the assistant bubble.
+              // Find current position by reference; if assistantMsg was
+              // removed (clear), append at end as best-effort.
+              final pos = _messages.indexOf(assistantMsg);
+              final insertAt = pos >= 0 ? pos : _messages.length;
               _messages.insert(
-                assistantIdx,
+                insertAt,
                 ChatMessage(
                   role: Role.system,
                   content: ev.toolName ?? 'tool',
@@ -235,8 +327,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                   // concrete proof (email message_id, file URL, etc).
                   ..meta = ev.raw;
               } else {
+                final pos = _messages.indexOf(assistantMsg);
+                final insertAt = pos >= 0 ? pos : _messages.length;
                 _messages.insert(
-                  _messages.length - 1, // before the active assistant bubble
+                  insertAt, // before the active assistant bubble
                   ChatMessage(
                     role: Role.system,
                     content: ev.text ?? '',
@@ -253,8 +347,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
 
           case StreamEventType.artifact:
             setState(() {
+              final pos = _messages.indexOf(assistantMsg);
+              final insertAt = pos >= 0 ? pos : _messages.length;
               _messages.insert(
-                _messages.length - 1, // before active assistant bubble
+                insertAt, // before active assistant bubble
                 ChatMessage(
                   role: Role.system,
                   content: ev.artifactLabel ?? 'Arquivo gerado',
@@ -272,19 +368,21 @@ class _ChatPageState extends ConsumerState<ChatPage> {
             break;
 
           case StreamEventType.error:
-            setState(() {
-              _messages[assistantIdx].content += ev.text ?? '';
-            });
+            if (mounted) {
+              setState(() {
+                assistantMsg.content += ev.text ?? '';
+              });
+            }
             break;
         }
       }
-    } catch (e) {
-      _messages[assistantIdx].content += '\n[erro: $e]';
+    } catch (e, s) {
+      CrashReporter.report(e, s, context: '_send.catch');
+      assistantMsg.content += '\n[erro: $e]';
     } finally {
       // Dispatch any [OPEN_INTENT] tags then strip them.
-      final cleaned =
-          await IntentLauncher.dispatch(_messages[assistantIdx].content);
-      _messages[assistantIdx].content = cleaned;
+      final cleaned = await IntentLauncher.dispatch(assistantMsg.content);
+      assistantMsg.content = cleaned;
       if (mounted) setState(() => _streaming = false);
       // Persist the final history to disk so opening the app later restores
       // exactly what the user sees right now (Wave 1 / C4).
@@ -298,6 +396,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
           gender: p.voiceGender,
         );
       }
+      CrashReporter.info('_send.done');
     }
   }
 
@@ -361,17 +460,18 @@ class _ChatPageState extends ConsumerState<ChatPage> {
 
   Future<void> _doUpload({required String path, required String kind}) async {
     final fileName = path.split(RegExp(r'[\\/]+')).last;
+    // v2.1.0: hold message reference rather than index (same fix as _send).
+    final placeholder = ChatMessage(
+      role: Role.system,
+      content: 'Enviando $fileName…',
+      kind: MessageKind.upload,
+      artifactType: kind,
+    );
     setState(() {
       _uploading = true;
-      _messages.add(ChatMessage(
-        role: Role.system,
-        content: 'Enviando $fileName…',
-        kind: MessageKind.upload,
-        artifactType: kind,
-      ));
+      _messages.add(placeholder);
     });
     _scrollToBottom();
-    final placeholderIdx = _messages.length - 1;
 
     try {
       final res = await _uploads.upload(path: path, kind: kind);
@@ -387,7 +487,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
         summary = '📎 ${res.fileName} ($pages)';
       }
       setState(() {
-        _messages[placeholderIdx]
+        placeholder
           ..content = summary
           ..artifactUrl = res.url
           ..meta = {
@@ -407,7 +507,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
       if (mounted) await _send(autoQuery);
     } catch (e) {
       setState(() {
-        _messages[placeholderIdx]
+        placeholder
           ..content = '⚠️ Falha ao enviar $fileName: $e'
           ..toolStatus = 'error';
         _uploading = false;
@@ -433,8 +533,30 @@ class _ChatPageState extends ConsumerState<ChatPage> {
       setState(() => _listening = false);
       return;
     }
+    // v2.1.0: refuse to start a new mic session while a stream is active —
+    // the resulting parallel _send would mutate _messages mid-flight and
+    // could produce stale references/RangeError.
+    if (_streaming) {
+      debugPrint('[mic] ignoring start while streaming');
+      return;
+    }
     final p = _persona;
     if (p == null) return;
+
+    // v1.6.0: pede permissão JIT quando user explicitamente clica no mic.
+    // Evita crash ao tentar startListening sem permissão concedida.
+    try {
+      final status = await Permission.microphone.request();
+      if (!status.isGranted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Permissão de microfone necessária pra falar.'),
+        ));
+        return;
+      }
+    } catch (e) {
+      debugPrint('[mic] permission request failed: $e');
+    }
+
     final localeId = p.voice.replaceAll('-', '_');
     setState(() {
       _listening = true;
@@ -443,12 +565,49 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     await _voice.startListening(
       localeId: localeId,
       onPartial: (s) => setState(() => _partialVoice = s),
-      onFinal: (s) {
+      onFinal: (s) async {
         setState(() {
           _listening = false;
           _partialVoice = '';
-          _input.text = s;
         });
+        // v1.6.0: tenta parser local de comandos universais ANTES de mandar
+        // pro chat. Se casar, executa direto + speak feedback. Se não casar,
+        // segue fluxo normal (manda pro SALIX/OSS).
+        try {
+          final voiceCmd = await IntentLauncher.handleVoiceCommand(s);
+          if (voiceCmd.matched) {
+            // Mostra na UI um chip "🎙️ comando executado" pra feedback visual.
+            setState(() {
+              _messages.add(ChatMessage(
+                role: Role.system,
+                content: voiceCmd.spokenFeedback ?? 'comando executado',
+                kind: MessageKind.toolResult,
+                toolName: 'voice_command',
+                toolStatus: 'ok',
+                meta: {'transcript': s},
+              ));
+            });
+            _scrollToBottom();
+            await _persistMessages();
+            // TTS feedback
+            if (voiceCmd.spokenFeedback != null) {
+              _voice.speak(
+                voiceCmd.spokenFeedback!,
+                lang: p.voice,
+                gender: p.voiceGender,
+              );
+            }
+            return;
+          }
+        } catch (e) {
+          debugPrint('[mic] voice command parse failed: $e');
+        }
+        // fallback: manda pro chat — guard streaming pra evitar _send paralelo.
+        if (_streaming) {
+          debugPrint('[mic] dropping voice input while streaming: $s');
+          return;
+        }
+        setState(() => _input.text = s);
         _send(s);
       },
     );
@@ -499,6 +658,15 @@ class _ChatPageState extends ConsumerState<ChatPage> {
             onPressed: () {
               Navigator.of(context).push(MaterialPageRoute(
                 builder: (_) => const MemoriesPage(),
+              ));
+            },
+          ),
+          IconButton(
+            tooltip: 'Capacidades (100+ tools)',
+            icon: const Icon(Icons.auto_fix_high),
+            onPressed: () {
+              Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => const ToolsCatalogPage(),
               ));
             },
           ),
@@ -700,6 +868,8 @@ class _Bubble extends StatelessWidget {
             txt = '✓ Busca completa${n is num ? ' (${n.toInt()} resultados)' : ''}';
           } else if (tool == 'analyze_image') {
             txt = '✓ Imagem analisada';
+          } else if (tool == 'voice_command') {
+            txt = '🎙️ ${text.isEmpty ? "comando executado" : text}';
           } else {
             txt = text.isEmpty ? '✓ $tool' : '✓ $tool — $text';
           }
