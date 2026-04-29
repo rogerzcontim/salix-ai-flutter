@@ -20,19 +20,18 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, salix-flutter]
     timeout-minutes: 30
+    env:
+      FLUTTER_HOME: C:\Users\cw\flutter
+      PATH_PREFIX: C:\Users\cw\flutter\bin;C:\Program Files\Git\cmd
     steps:
       - uses: actions/checkout@v4
 
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          flutter-version: '3.27.4'
-
-      - name: Verify Flutter
+      - name: Verify Flutter (self-hosted)
         shell: pwsh
         run: |
+          $env:Path = "$env:PATH_PREFIX;$env:Path"
           flutter --version
           flutter config --enable-windows-desktop
           flutter doctor -v
