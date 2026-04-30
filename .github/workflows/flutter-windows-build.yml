@@ -69,12 +69,21 @@ jobs:
           }
 
       - name: Create Flutter project
-        shell: powershell
+        shell: cmd
+        timeout-minutes: 8
         run: |
-          $env:Path = "C:\flutter\bin;C:\Program Files\Git\cmd;$env:Path"
-          $name = "${{ github.event.inputs.project_name }}"
-          flutter --suppress-analytics --no-cli-animations create --project-name=$name --org=ai.ironedge --platforms=windows $name
-          if ($LASTEXITCODE -ne 0) { throw "flutter create failed" }
+          set PATH=C:\flutter\bin;C:\Program Files\Git\cmd;%PATH%
+          set CI=true
+          set FLUTTER_SUPPRESS_ANALYTICS=true
+          set CI_ANALYTICS_DISABLED=true
+          set NAME=${{ github.event.inputs.project_name }}
+          echo Running flutter create with stdin redirected from NUL...
+          flutter --suppress-analytics --no-cli-animations create --project-name=%NAME% --org=ai.ironedge --platforms=windows %NAME% < NUL
+          if errorlevel 1 (
+            echo flutter create failed with errorlevel %errorlevel%
+            exit /b 1
+          )
+          echo flutter create OK
 
       - name: Apply main.dart, pubspec extras, assets
         shell: powershell
