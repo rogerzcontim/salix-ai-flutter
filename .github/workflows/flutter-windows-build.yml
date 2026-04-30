@@ -20,21 +20,24 @@ on:
 
 jobs:
   build:
-    # TEMPORARY: cloud windows-latest enquanto VM dedicado nao opera (Windows installer hung 393KB)
-    # Quando VM funcionar, voltar para [self-hosted, Windows, X64, dedicado-vm]
-    runs-on: windows-latest
+    # Self-hosted Windows Server 2022 VM (dedicado-vm). Flutter SDK pre-installed at C:\flutter
+    runs-on: [self-hosted, Windows, X64, dedicado-vm]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Ensure PATH
+        shell: pwsh
+        run: |
+          $env:Path = "C:\flutter\bin;C:\Program Files\Git\cmd;$env:Path"
+          [Environment]::SetEnvironmentVariable('Path', $env:Path, 'Process')
+          echo "C:\flutter\bin" >> $env:GITHUB_PATH
+          echo "C:\Program Files\Git\cmd" >> $env:GITHUB_PATH
 
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          flutter-version: '3.27.4'
+      - uses: actions/checkout@v4
 
       - name: Verify Flutter
         shell: pwsh
         run: |
+          $env:Path = "C:\flutter\bin;C:\Program Files\Git\cmd;$env:Path"
           flutter --version
           flutter config --enable-windows-desktop --no-analytics
           flutter doctor -v
@@ -61,6 +64,7 @@ jobs:
       - name: Create Flutter project
         shell: pwsh
         run: |
+          $env:Path = "C:\flutter\bin;C:\Program Files\Git\cmd;$env:Path"
           $name = "${{ github.event.inputs.project_name }}"
           flutter create --project-name=$name --org=ai.ironedge --platforms=windows $name
           if ($LASTEXITCODE -ne 0) { throw "flutter create failed" }
@@ -97,12 +101,14 @@ jobs:
         shell: pwsh
         working-directory: ${{ github.event.inputs.project_name }}
         run: |
+          $env:Path = "C:\flutter\bin;C:\Program Files\Git\cmd;$env:Path"
           flutter pub get
 
       - name: flutter build windows --release
         shell: pwsh
         working-directory: ${{ github.event.inputs.project_name }}
         run: |
+          $env:Path = "C:\flutter\bin;C:\Program Files\Git\cmd;$env:Path"
           flutter build windows --release
 
       - name: Zip artifact
