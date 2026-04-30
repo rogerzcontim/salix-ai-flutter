@@ -160,6 +160,15 @@ jobs:
           set PATH=C:\flutter\bin;C:\Program Files\Git\cmd;%PATH%
           set CI=true
           set FLUTTER_SUPPRESS_ANALYTICS=true
+          if exist "C:\BT\VC\Auxiliary\Build\vcvars64.bat" (
+            echo Loading MSVC env from C:\BT...
+            call "C:\BT\VC\Auxiliary\Build\vcvars64.bat"
+          ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
+            echo Loading MSVC env from Program Files...
+            call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          ) else (
+            echo WARNING: vcvars64.bat not found
+          )
           flutter --suppress-analytics build windows --release
 
       - name: Zip artifact
