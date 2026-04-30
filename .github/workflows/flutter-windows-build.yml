@@ -34,7 +34,32 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Warm Flutter (verbose, first-run safe)
+      - name: Diagnose VM environment
+        shell: cmd
+        timeout-minutes: 3
+        run: |
+          set PATH=C:\flutter\bin;C:\Program Files\Git\cmd;%PATH%
+          echo === [DIAG] PATH ===
+          echo %PATH%
+          echo === [DIAG] where flutter ===
+          where flutter 2>&1
+          echo === [DIAG] where git ===
+          where git 2>&1
+          echo === [DIAG] dir C:\flutter ===
+          dir C:\flutter 2>&1
+          echo === [DIAG] dir C:\flutter\bin ===
+          dir C:\flutter\bin 2>&1
+          echo === [DIAG] type C:\flutter\version ===
+          type C:\flutter\version 2>&1
+          echo === [DIAG] git --version ===
+          git --version 2>&1
+          echo === [DIAG] git -C C:\flutter status (quick) ===
+          git -C C:\flutter status --short 2>&1
+          echo === [DIAG] del .warmed_up to force fresh ===
+          if exist C:\flutter\.warmed_up del C:\flutter\.warmed_up
+          echo === [DIAG] Done. ===
+
+      - name: Warm Flutter (verbose, fresh every time)
         shell: cmd
         timeout-minutes: 25
         run: |
@@ -42,21 +67,18 @@ jobs:
           set CI=true
           set FLUTTER_SUPPRESS_ANALYTICS=true
           set CI_ANALYTICS_DISABLED=true
-          if exist C:\flutter\.warmed_up (
-            echo [WARM] Flutter pre-warmed, running quick version check.
-            flutter --suppress-analytics --no-cli-animations --version < NUL
-          ) else (
-            echo [WARM] First-run warmup starting at %TIME%...
-            echo [WARM] Step 1/3: flutter --version -v
-            flutter --suppress-analytics --no-cli-animations --version -v < NUL
-            if errorlevel 1 ( echo flutter --version failed & exit /b 1 )
-            echo [WARM] Step 2/3: flutter precache --windows -v
-            flutter --suppress-analytics --no-cli-animations precache --windows --no-android --no-ios -v < NUL
-            if errorlevel 1 ( echo flutter precache failed & exit /b 1 )
-            echo [WARM] Step 3/3: writing .warmed_up flag
-            type nul > C:\flutter\.warmed_up
-            echo [WARM] Done at %TIME%.
-          )
+          set FLUTTER_NO_AUTO_UPDATE=true
+          echo [WARM] Starting at %TIME%
+          echo [WARM] Step 1/2: flutter --version -v (output every line as it streams)
+          flutter --suppress-analytics --no-cli-animations --version -v < NUL
+          if errorlevel 1 ( echo flutter --version FAILED with errorlevel %errorlevel% & exit /b 1 )
+          echo [WARM] flutter --version OK at %TIME%
+          echo [WARM] Step 2/2: flutter precache --windows -v
+          flutter --suppress-analytics --no-cli-animations precache --windows --no-android --no-ios -v < NUL
+          if errorlevel 1 ( echo flutter precache FAILED with errorlevel %errorlevel% & exit /b 1 )
+          echo [WARM] precache OK at %TIME%
+          type nul > C:\flutter\.warmed_up
+          echo [WARM] All done at %TIME%
 
       - name: Decode inputs
         shell: powershell
