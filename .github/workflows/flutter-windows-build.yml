@@ -34,20 +34,29 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Verify Flutter (skip if pre-warmed)
+      - name: Warm Flutter (verbose, first-run safe)
         shell: cmd
-        timeout-minutes: 3
+        timeout-minutes: 25
         run: |
           set PATH=C:\flutter\bin;C:\Program Files\Git\cmd;%PATH%
           set CI=true
           set FLUTTER_SUPPRESS_ANALYTICS=true
+          set CI_ANALYTICS_DISABLED=true
           if exist C:\flutter\.warmed_up (
-            echo Flutter pre-warmed, skipping verify.
+            echo [WARM] Flutter pre-warmed, running quick version check.
+            flutter --suppress-analytics --no-cli-animations --version < NUL
           ) else (
-            echo WARNING: Flutter not pre-warmed. Run "flutter precache --windows" manually inside VM ONCE.
-            echo Continuing without warmup...
+            echo [WARM] First-run warmup starting at %TIME%...
+            echo [WARM] Step 1/3: flutter --version -v
+            flutter --suppress-analytics --no-cli-animations --version -v < NUL
+            if errorlevel 1 ( echo flutter --version failed & exit /b 1 )
+            echo [WARM] Step 2/3: flutter precache --windows -v
+            flutter --suppress-analytics --no-cli-animations precache --windows --no-android --no-ios -v < NUL
+            if errorlevel 1 ( echo flutter precache failed & exit /b 1 )
+            echo [WARM] Step 3/3: writing .warmed_up flag
+            type nul > C:\flutter\.warmed_up
+            echo [WARM] Done at %TIME%.
           )
-          echo Done.
 
       - name: Decode inputs
         shell: powershell
@@ -70,20 +79,20 @@ jobs:
 
       - name: Create Flutter project
         shell: cmd
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: |
           set PATH=C:\flutter\bin;C:\Program Files\Git\cmd;%PATH%
           set CI=true
           set FLUTTER_SUPPRESS_ANALYTICS=true
           set CI_ANALYTICS_DISABLED=true
           set NAME=${{ github.event.inputs.project_name }}
-          echo Running flutter create with stdin redirected from NUL...
-          flutter --suppress-analytics --no-cli-animations create --project-name=%NAME% --org=ai.ironedge --platforms=windows %NAME% < NUL
+          echo [CREATE] Starting at %TIME% with verbose output...
+          flutter --suppress-analytics --no-cli-animations create --project-name=%NAME% --org=ai.ironedge --platforms=windows -v %NAME% < NUL
           if errorlevel 1 (
             echo flutter create failed with errorlevel %errorlevel%
             exit /b 1
           )
-          echo flutter create OK
+          echo [CREATE] Done at %TIME%.
 
       - name: Apply main.dart, pubspec extras, assets
         shell: powershell
