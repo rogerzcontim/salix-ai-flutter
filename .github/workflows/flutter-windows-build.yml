@@ -20,6 +20,8 @@ on:
 
 jobs:
   build:
+    # TEMPORARY: cloud windows-latest enquanto VM dedicado nao opera (Windows installer hung 393KB)
+    # Quando VM funcionar, voltar para [self-hosted, Windows, X64, dedicado-vm]
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -34,7 +36,7 @@ jobs:
         shell: pwsh
         run: |
           flutter --version
-          flutter config --enable-windows-desktop
+          flutter config --enable-windows-desktop --no-analytics
           flutter doctor -v
 
       - name: Decode inputs
@@ -82,8 +84,8 @@ jobs:
           if (Test-Path "$env:GITHUB_WORKSPACE\assets.json") {
             $assets = Get-Content "$env:GITHUB_WORKSPACE\assets.json" -Raw | ConvertFrom-Json
             foreach ($prop in $assets.PSObject.Properties) {
-              $rel = $prop.Name -replace '\\.\\.[\\/\\\\]', ''
-              $rel = $rel -replace '^[\\/\\\\]', ''
+              $rel = $prop.Name -replace '\.\.[\\/]', ''
+              $rel = $rel -replace '^[\\/]', ''
               $full = Join-Path $proj $rel
               $dir = Split-Path $full -Parent
               if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -94,12 +96,14 @@ jobs:
       - name: flutter pub get
         shell: pwsh
         working-directory: ${{ github.event.inputs.project_name }}
-        run: flutter pub get
+        run: |
+          flutter pub get
 
       - name: flutter build windows --release
         shell: pwsh
         working-directory: ${{ github.event.inputs.project_name }}
-        run: flutter build windows --release
+        run: |
+          flutter build windows --release
 
       - name: Zip artifact
         shell: pwsh
