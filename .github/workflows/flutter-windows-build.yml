@@ -22,7 +22,7 @@ jobs:
   build:
     # Self-hosted Windows Server 2022 VM (dedicado-vm). Flutter SDK pre-installed at C:\flutter
     runs-on: [self-hosted, Windows, X64, dedicado-vm]
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Ensure PATH
         shell: powershell
