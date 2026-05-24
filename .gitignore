@@ -31,3 +31,11 @@ build_*.log
 # IDE
 .vscode/
 .idea/
+
+# Secrets / provisioning (NUNCA commitar)
+.tmp_*
+*.env
+*.env.*
+setup_inside_windows.ps1
+secrets/
+.credentials/
